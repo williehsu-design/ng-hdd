@@ -20,7 +20,7 @@ CITIES = {
     "LA":       (34.0522, -118.2437, 0.10),
 }
 
-def fetch_daily_mean_f(lat, lon):
+def fetch_daily_mean_f(lat, lon, retries=4):
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -29,25 +29,49 @@ def fetch_daily_mean_f(lat, lon):
         f"&forecast_days={FORECAST_DAYS}"
         "&timezone=UTC"
     )
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()["daily"]["temperature_2m_mean"]
+
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            return r.json()["daily"]["temperature_2m_mean"]
+        except Exception as e:
+            last_err = e
+
+    # 連續失敗：回傳 None，不要直接炸掉 workflow
+    print(f"[WARN] open-meteo failed after {retries} tries: {last_err}")
+    return None
 
 def hdd(temp_f):
     return max(0.0, BASE_F - temp_f)
 
 def compute_15d_hdd():
     total = 0.0
+    used_weight = 0.0
+
     for lat, lon, weight in CITIES.values():
         temps = fetch_daily_mean_f(lat, lon)
+        if temps is None:
+            continue
         total += weight * sum(hdd(t) for t in temps)
-    return total
+        used_weight += weight
+
+    if used_weight == 0:
+        return None  # 全掛了
+    # 如果少城市，做權重補正，避免數值突然變小
+    return total / used_weight
+
 
 FILE = "ng_hdd_data.csv"
 
 def run_system():
     today = str(date.today())
     today_val = compute_15d_hdd()
+if today_val is None:
+    print("[WARN] Weather API unavailable today. Skip update (do not fail).")
+    return
+
 
     if os.path.exists(FILE):
         df = pd.read_csv(FILE)
