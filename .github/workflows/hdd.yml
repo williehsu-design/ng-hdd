@@ -15,8 +15,10 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,7 +26,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run HDD script
         run: python hdd_system.py
 
       - name: Commit & push results
@@ -32,14 +34,20 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git pull --rebase origin main
+          # 先同步遠端
+          git fetch origin main
+          git rebase origin/main
 
+          # 加入新資料
           git add ng_hdd_data.csv hdd_chart.png
 
+          # 沒變動就結束
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
           git commit -m "Daily HDD update"
-          git push
+
+          # 推回 repo
+          git push origin HEAD:main
