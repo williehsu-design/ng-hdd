@@ -1,14 +1,16 @@
 import os
+import time
 import requests
 import pandas as pd
 from datetime import date
 
 import matplotlib
-matplotlib.use("Agg")  # ✅ GitHub Actions/headless 必備
+matplotlib.use("Agg")  # GitHub Actions/headless 必備
 import matplotlib.pyplot as plt
 
 BASE_F = 65.0
 FORECAST_DAYS = 15
+FILE = "ng_hdd_data.csv"
 
 CITIES = {
     "New_York": (40.7128, -74.0060, 0.20),
@@ -20,7 +22,7 @@ CITIES = {
     "LA":       (34.0522, -118.2437, 0.10),
 }
 
-def fetch_daily_mean_f(lat, lon, retries=4):
+def fetch_daily_mean_f(lat, lon, retries=5, backoff=2):
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -34,44 +36,31 @@ def fetch_daily_mean_f(lat, lon, retries=4):
     for i in range(retries):
         try:
             r = requests.get(url, timeout=30)
+            # Open-Meteo 偶爾 502/503，這裡讓它重試
+            if r.status_code in (502, 503, 504):
+                raise requests.HTTPError(f"{r.status_code} transient error", response=r)
             r.raise_for_status()
-            return r.json()["daily"]["temperature_2m_mean"]
+            data = r.json()
+            return data["daily"]["temperature_2m_mean"]
         except Exception as e:
             last_err = e
+            time.sleep(backoff ** i)  # 1,2,4,8... 秒
 
-    # 連續失敗：回傳 None，不要直接炸掉 workflow
-    print(f"[WARN] open-meteo failed after {retries} tries: {last_err}")
-    return None
+    raise RuntimeError(f"Open-Meteo failed after retries: {last_err}")
 
 def hdd(temp_f):
-    return max(0.0, BASE_F - temp_f)
+    return max(0.0, BASE_F - float(temp_f))
 
 def compute_15d_hdd():
     total = 0.0
-    used_weight = 0.0
-
-    for lat, lon, weight in CITIES.values():
+    for _, (lat, lon, weight) in CITIES.items():
         temps = fetch_daily_mean_f(lat, lon)
-        if temps is None:
-            continue
         total += weight * sum(hdd(t) for t in temps)
-        used_weight += weight
-
-    if used_weight == 0:
-        return None  # 全掛了
-    # 如果少城市，做權重補正，避免數值突然變小
-    return total / used_weight
-
-
-FILE = "ng_hdd_data.csv"
+    return total
 
 def run_system():
     today = str(date.today())
     today_val = compute_15d_hdd()
-if today_val is None:
-    print("[WARN] Weather API unavailable today. Skip update (do not fail).")
-    return
-
 
     if os.path.exists(FILE):
         df = pd.read_csv(FILE)
@@ -86,8 +75,8 @@ if today_val is None:
     df.to_csv(FILE, index=False)
 
     print("\n==============================")
-    print(f"15-Day Weighted HDD: {round(today_val,2)}")
-    print(f"Delta vs Yesterday: {round(delta,2)}")
+    print(f"15-Day Weighted HDD: {round(today_val, 2)}")
+    print(f"Delta vs Yesterday: {round(delta, 2)}")
     if delta > 5:
         print("Signal: 🔥 Bullish Weather Revision")
     elif delta < -5:
@@ -106,4 +95,3 @@ if today_val is None:
 
 if __name__ == "__main__":
     run_system()
-
