@@ -1,9 +1,9 @@
 name: HDD Daily Run
 
 on:
-  schedule:
-    - cron: "0 12 * * *"   # 每天 UTC 12:00 = 泰國 19:00
   workflow_dispatch:
+  schedule:
+    - cron: "5 0,12 * * *"  # 00Z / 12Z
 
 concurrency:
   group: hdd-daily
@@ -15,17 +15,11 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Sync with origin/main
-        run: |
-          set -eux
-          git pull --rebase origin main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,24 +32,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script (sends Telegram)
+      - name: Run script (also sends Telegram)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          LAT: ${{ secrets.LAT }}
-          LON: ${{ secrets.LON }}
-          BASE_F: "65.0"
+          # 可選：你要改地點/參數就在 Secrets 或這裡 env 設定
+          LAT: "40.7128"
+          LON: "-74.0060"
+          BASE_F: "65"
+          FORECAST_DAYS: "16"
+          PAST_DAYS: "20"
         run: |
           set -eux
           python hdd_system.py
 
-      - name: Commit & push results
+      - name: Commit & push results (csv + chart)
         run: |
           set -eux
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_cdd_chart.png
+          git add ng_hdd_data.csv hdd_chart.png
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
@@ -63,5 +60,6 @@ jobs:
           fi
 
           git commit -m "Daily HDD/CDD update"
+
           git pull --rebase origin main
           git push origin HEAD:main
