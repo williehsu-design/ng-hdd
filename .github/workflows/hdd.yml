@@ -15,12 +15,19 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # ✅ 先把本地工作目錄強制對齊遠端 main，避免 push 時 fetch-first
+      - name: Sync with origin/main
+        run: |
+          set -eux
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,7 +45,7 @@ jobs:
           set -eux
           python hdd_system.py
 
-           - name: Commit & push results
+      - name: Commit & push results
         run: |
           set -eux
 
@@ -54,7 +61,5 @@ jobs:
 
           git commit -m "Daily HDD update"
 
-          # 🔥 用 pull --rebase 取代 fetch + rebase（比較穩）
-          git pull --rebase origin main
-
-          git push origin main
+          # ✅ push（如果剛好又被更新，重試一次）
+          git push origin main || (git fetch origin main && git reset --hard origin/main && exit 1)
