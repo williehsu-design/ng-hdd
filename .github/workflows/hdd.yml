@@ -15,12 +15,18 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # ✅ 先把遠端 main 同步乾淨（這時候 repo 還沒被產檔弄髒）
+      - name: Sync with origin/main
+        run: |
+          set -eux
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,10 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - name: Run system
         run: |
           set -eux
           python hdd_system.py
@@ -48,9 +51,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 先把遠端最新抓下來，避免 non-fast-forward
-          git pull --rebase origin main
-
           git add ng_hdd_data.csv hdd_chart.png
 
           if git diff --cached --quiet; then
@@ -59,4 +59,8 @@ jobs:
           fi
 
           git commit -m "Daily HDD update"
-          git push origin main
+
+          # ✅ 推之前再抓一次，避免剛好有人推新 commit
+          git pull --rebase --autostash origin main
+
+          git push origin HEAD:main
