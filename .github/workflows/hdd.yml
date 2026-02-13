@@ -45,19 +45,27 @@ jobs:
         run: |
           set -eux
           python hdd_system.py
-
       - name: Commit & push results (csv + chart)
         run: |
           set -eux
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # 1) 先把工作區同步到遠端最新 main，避免 fetch-first
+          git fetch origin main
+          git reset --hard origin/main
+
+          # 2) 把本次產生的檔案加進來
           git add ng_hdd_data.csv hdd_chart.png
 
+          # 3) 沒變更就結束
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
+          # 4) commit + push
           git commit -m "Daily HDD update"
           git push origin HEAD:main
+
