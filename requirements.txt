@@ -1,4 +1,5 @@
-requests
-pandas
-matplotlib
-yfinance
+requests==2.32.3
+pandas==2.2.2
+matplotlib==3.9.0
+python-dateutil==2.9.0.post0
+pytz==2025.1
