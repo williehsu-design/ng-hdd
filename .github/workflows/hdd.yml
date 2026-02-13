@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"  # 每天 UTC 00:00 
+    - cron: "0 0 * * *"   # 每天 UTC 00:00
 
 concurrency:
   group: hdd-daily
@@ -15,20 +15,18 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync with origin/main (before running)
+      - name: Sync with origin/main (avoid fetch-first issues)
         run: |
           set -eux
-          git pull --rebase origin main
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,30 +40,32 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run script (also sends Telegram)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          LAT: ${{ secrets.LAT }}
+          LON: ${{ secrets.LON }}
+          BASE_F: "65"
+          FORECAST_DAYS: "30"
+          # 可選（你之後要加也行）
+          STORAGE_PRICE: ${{ secrets.STORAGE_PRICE }}
+          NG_PRICE: ${{ secrets.NG_PRICE }}
         run: |
           set -eux
           python hdd_system.py
+
       - name: Commit & push results (csv + chart)
         run: |
           set -eux
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 1) 先把工作區同步到遠端最新 main，避免 fetch-first
-          git fetch origin main
-          git reset --hard origin/main
-
-          # 2) 把本次產生的檔案加進來
           git add ng_hdd_data.csv hdd_chart.png
 
-          # 3) 沒變更就結束
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          # 4) commit + push
           git commit -m "Daily HDD update"
           git push origin HEAD:main
-
