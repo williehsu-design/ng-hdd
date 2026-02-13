@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 import pandas as pd
 from datetime import date
@@ -22,8 +21,10 @@ CITIES = {
 }
 
 FILE = "ng_hdd_data.csv"
+CHART = "hdd_chart.png"
 
-def fetch_daily_mean_f(lat, lon, retries=5, backoff=2):
+
+def fetch_daily_mean_f(lat, lon):
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -32,20 +33,14 @@ def fetch_daily_mean_f(lat, lon, retries=5, backoff=2):
         f"&forecast_days={FORECAST_DAYS}"
         "&timezone=UTC"
     )
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()["daily"]["temperature_2m_mean"]
 
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, timeout=30)
-            r.raise_for_status()
-            return r.json()["daily"]["temperature_2m_mean"]
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff ** i)  # 1,2,4,8...秒
-    raise RuntimeError(f"Open-Meteo failed after retries: {last_err}")
 
 def hdd(temp_f):
     return max(0.0, BASE_F - temp_f)
+
 
 def compute_15d_hdd():
     total = 0.0
@@ -54,19 +49,47 @@ def compute_15d_hdd():
         total += weight * sum(hdd(t) for t in temps)
     return total
 
-def send_telegram(text: str):
-    token = os.getenv("TG_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TG_CHAT_ID", "").strip()
 
-    if not token or not chat_id:
-        print("Telegram skipped: TG_BOT_TOKEN / TG_CHAT_ID not set.")
-        return
+def signal_text(delta):
+    if delta > 5:
+        return "🔥 Bullish (HDD 上修)"
+    elif delta < -5:
+        return "❄ Bearish (HDD 下修)"
+    else:
+        return "😐 Neutral"
 
+
+def format_msg(today, today_val, delta):
+    return (
+        f"🧊 HDD 15D Update ({today})\n"
+        f"────────────────────\n"
+        f"15-Day Weighted HDD: {today_val:.2f}\n"
+        f"Δ vs Previous:       {delta:+.2f}\n"
+        f"Signal:              {signal_text(delta)}\n"
+    )
+
+
+def tg_send_message(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
-    print("Telegram sent.")
+
+
+def tg_send_photo(token, chat_id, photo_path, caption=None):
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        files = {"photo": f}
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        r = requests.post(url, data=data, files=files, timeout=60)
+    r.raise_for_status()
+
 
 def run_system():
     today = str(date.today())
@@ -84,33 +107,35 @@ def run_system():
     df = pd.concat([df, new_row], ignore_index=True)
     df.to_csv(FILE, index=False)
 
-    if delta > 5:
-        signal = "🔥 Bullish Weather Revision"
-    elif delta < -5:
-        signal = "❄ Bearish Weather Revision"
-    else:
-        signal = "😐 Neutral"
-
-    msg = (
-        f"HDD 15D Update ({today})\n"
-        f"15-Day Weighted HDD: {today_val:.2f}\n"
-        f"Delta vs Yesterday: {delta:.2f}\n"
-        f"Signal: {signal}"
-    )
-
-    print("\n==============================")
-    print(msg)
-    print("==============================")
-
+    # chart
     plt.figure()
     plt.plot(df["date"], df["hdd_15d"])
     plt.xticks(rotation=45)
     plt.title("15-Day Weighted HDD")
     plt.tight_layout()
-    plt.savefig("hdd_chart.png")
-    print("Chart saved as hdd_chart.png")
+    plt.savefig(CHART)
 
-    send_telegram(msg)
+    # console
+    print(format_msg(today, today_val, delta))
+    print(f"Saved: {FILE}, {CHART}")
+
+    # telegram (optional)
+    token = os.getenv("TG_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TG_CHAT_ID", "").strip()
+
+    if token and chat_id:
+        msg = format_msg(today, today_val, delta)
+        try:
+            tg_send_message(token, chat_id, msg)
+            # 圖片用很短 caption，避免重複一堆文字
+            tg_send_photo(token, chat_id, CHART, caption=f"📈 HDD Trend ({today})")
+            print("Telegram: sent message + chart")
+        except Exception as e:
+            # 你如果希望 Telegram 失敗就讓整個 Actions 失敗，把這行改成 raise
+            print(f"Telegram send failed: {e}")
+    else:
+        print("Telegram skipped: TG_BOT_TOKEN / TG_CHAT_ID not set")
+
 
 if __name__ == "__main__":
     run_system()
