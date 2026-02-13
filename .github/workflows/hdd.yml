@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"   # 每天 UTC 00:00
+    - cron: "0 0 * * *"   # 每天 UTC 00:00（泰國是 07:00）
 
 concurrency:
   group: hdd-daily
@@ -22,12 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ✅ 先同步遠端（此時 repo 還是乾淨的）
-      - name: Sync with origin/main
-        run: |
-          set -eux
-          git pull --rebase origin main
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -39,10 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - name: Run script
         run: |
           set -eux
           python hdd_system.py
@@ -54,6 +45,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # 先把本地修改自動暫存，rebase 遠端最新，再把修改放回來
+          git pull --rebase --autostash origin main
+
           git add ng_hdd_data.csv hdd_chart.png
 
           if git diff --cached --quiet; then
@@ -62,8 +56,4 @@ jobs:
           fi
 
           git commit -m "Daily HDD update"
-
-          # ✅ push 前再保險：如果遠端剛好多了一個 commit，就把自己的 commit rebase 上去
-          git pull --rebase origin main
-
           git push origin main
