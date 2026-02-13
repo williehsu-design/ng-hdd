@@ -33,13 +33,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-       - name: Run script (also sends Telegram)
-  env:
-    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-    EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
-  run: |
-    python hdd_system.py
+      - name: Run script (also sends Telegram)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+        run: |
+          python hdd_system.py
 
       - name: Commit & push results (csv + chart)
         run: |
@@ -47,7 +47,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_cdd_chart.png
+          git add ng_hdd_data.csv hdd_cdd_chart.png || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
