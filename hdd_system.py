@@ -1,4 +1,5 @@
 import os
+EIA_API_KEY = os.getenv("EIA_API_KEY")
 import json
 import time
 import math
