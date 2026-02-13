@@ -38,14 +38,14 @@ jobs:
           set -eux
           python hdd_system.py
 
-      - name: Commit & push results
+           - name: Commit & push results
         run: |
           set -eux
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 先把本地修改自動暫存，rebase 遠端最新，再把修改放回來
+          # 先暫存本地改動 -> rebase 遠端 -> 再放回來
           git pull --rebase --autostash origin main
 
           git add ng_hdd_data.csv hdd_chart.png
@@ -57,3 +57,4 @@ jobs:
 
           git commit -m "Daily HDD update"
           git push origin main
+
