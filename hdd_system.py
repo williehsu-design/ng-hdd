@@ -7,7 +7,7 @@ from datetime import date
 import matplotlib
 matplotlib.use("Agg")  # GitHub Actions/headless 必備
 import matplotlib.pyplot as plt
-
+ 
 BASE_F = 65.0
 FORECAST_DAYS = 15
 FILE = "ng_hdd_data.csv"
