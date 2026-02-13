@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"  # 每天 UTC 00:00
+    - cron: "0 0 * * *"  # 每天 UTC 00:00 
 
 concurrency:
   group: hdd-daily
