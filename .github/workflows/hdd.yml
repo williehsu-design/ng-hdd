@@ -3,14 +3,12 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"  # 每天 00:00 UTC
+    - cron: "0 0 * * *"
 
-# ✅ 避免同時兩個 run 互搶 push
 concurrency:
   group: hdd-daily
   cancel-in-progress: false
 
-# ✅ 讓 GITHUB_TOKEN 可以 push 回 repo
 permissions:
   contents: write
 
@@ -22,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # ✅ 需要完整歷史，rebase 才不會怪
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,18 +29,23 @@ jobs:
 
       - name: Install deps
         run: |
+          set -eux
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run
-        run: python hdd_system.py
+        run: |
+          set -eux
+          python hdd_system.py
 
       - name: Commit & push results
         run: |
-          set -e
+          set -eux
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git status
 
           git add ng_hdd_data.csv hdd_chart.png
 
@@ -53,16 +56,9 @@ jobs:
 
           git commit -m "Daily HDD update"
 
-          # ✅ 如果遠端剛好被別的 run 更新，rebase 後重推
-          for i in 1 2 3 4 5; do
-            git pull --rebase origin main || true
-            if git push origin HEAD:main; then
-              echo "Push success."
-              exit 0
-            fi
-            echo "Push failed (attempt $i). Retry in 5s..."
-            sleep 5
-          done
+          # ✅ 先抓遠端最新，再把自己的 commit 疊上去
+          git fetch origin main
+          git rebase origin/main
 
-          echo "Push failed after retries."
-          exit 1
+          # ✅ 推回 main
+          git push origin HEAD:main
