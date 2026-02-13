@@ -22,15 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ✅ 先把 runner 的工作目錄強制同步到最新的 origin/main（這一步要在跑腳本前）
-      - name: Sync with origin/main
-        run: |
-          set -eux
-          git note remove refs/notes/commits || true
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -42,23 +33,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run
         run: |
           set -eux
           python hdd_system.py
-
-      # ✅ （可選）你要 Telegram 通知就保留這段
-      - name: Send Telegram message
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          set -eux
-          LAST_LINE="$(tail -n 1 ng_hdd_data.csv || true)"
-          MSG="✅ HDD updated\n${LAST_LINE}"
-          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            -d "text=${MSG}" >/dev/null
 
       - name: Commit & push results
         run: |
@@ -75,7 +53,32 @@ jobs:
 
           git commit -m "Daily HDD update"
 
-          # ✅ 避免同時間有人/另一個run已經推到 main：rebase + autostash 最保險
-          git pull --rebase --autostash origin main
+          # 先抓遠端最新，再把自己的 commit 疊上去
+          git fetch origin main
+          git rebase origin/main
 
+          # 推回 main
           git push origin HEAD:main
+
+      # ✅ 這步才是「發送 Telegram」
+      - name: Notify Telegram
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -eux
+          # 避免 secrets 沒設造成無聲失敗
+          if [ -z "${TG_BOT_TOKEN}" ] || [ -z "${TG_CHAT_ID}" ]; then
+            echo "Missing TG_BOT_TOKEN or TG_CHAT_ID secrets"
+            exit 1
+          fi
+
+          MSG="HDD Daily Run ✅
+Repo: $GITHUB_REPOSITORY
+Branch: $GITHUB_REF_NAME
+Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}"
