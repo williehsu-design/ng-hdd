@@ -5,12 +5,11 @@ import pandas as pd
 from datetime import date
 
 import matplotlib
-matplotlib.use("Agg")  # GitHub Actions/headless 必備
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
- 
+
 BASE_F = 65.0
 FORECAST_DAYS = 15
-FILE = "ng_hdd_data.csv"
 
 CITIES = {
     "New_York": (40.7128, -74.0060, 0.20),
@@ -21,6 +20,8 @@ CITIES = {
     "Denver":   (39.7392, -104.9903, 0.10),
     "LA":       (34.0522, -118.2437, 0.10),
 }
+
+FILE = "ng_hdd_data.csv"
 
 def fetch_daily_mean_f(lat, lon, retries=5, backoff=2):
     url = (
@@ -36,27 +37,36 @@ def fetch_daily_mean_f(lat, lon, retries=5, backoff=2):
     for i in range(retries):
         try:
             r = requests.get(url, timeout=30)
-            # Open-Meteo 偶爾 502/503，這裡讓它重試
-            if r.status_code in (502, 503, 504):
-                raise requests.HTTPError(f"{r.status_code} transient error", response=r)
             r.raise_for_status()
-            data = r.json()
-            return data["daily"]["temperature_2m_mean"]
+            return r.json()["daily"]["temperature_2m_mean"]
         except Exception as e:
             last_err = e
-            time.sleep(backoff ** i)  # 1,2,4,8... 秒
-
+            time.sleep(backoff ** i)  # 1,2,4,8...秒
     raise RuntimeError(f"Open-Meteo failed after retries: {last_err}")
 
 def hdd(temp_f):
-    return max(0.0, BASE_F - float(temp_f))
+    return max(0.0, BASE_F - temp_f)
 
 def compute_15d_hdd():
     total = 0.0
-    for _, (lat, lon, weight) in CITIES.items():
+    for lat, lon, weight in CITIES.values():
         temps = fetch_daily_mean_f(lat, lon)
         total += weight * sum(hdd(t) for t in temps)
     return total
+
+def send_telegram(text: str):
+    token = os.getenv("TG_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TG_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
+        print("Telegram skipped: TG_BOT_TOKEN / TG_CHAT_ID not set.")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    r = requests.post(url, json=payload, timeout=30)
+    r.raise_for_status()
+    print("Telegram sent.")
 
 def run_system():
     today = str(date.today())
@@ -74,15 +84,22 @@ def run_system():
     df = pd.concat([df, new_row], ignore_index=True)
     df.to_csv(FILE, index=False)
 
-    print("\n==============================")
-    print(f"15-Day Weighted HDD: {round(today_val, 2)}")
-    print(f"Delta vs Yesterday: {round(delta, 2)}")
     if delta > 5:
-        print("Signal: 🔥 Bullish Weather Revision")
+        signal = "🔥 Bullish Weather Revision"
     elif delta < -5:
-        print("Signal: ❄ Bearish Weather Revision")
+        signal = "❄ Bearish Weather Revision"
     else:
-        print("Signal: Neutral")
+        signal = "😐 Neutral"
+
+    msg = (
+        f"HDD 15D Update ({today})\n"
+        f"15-Day Weighted HDD: {today_val:.2f}\n"
+        f"Delta vs Yesterday: {delta:.2f}\n"
+        f"Signal: {signal}"
+    )
+
+    print("\n==============================")
+    print(msg)
     print("==============================")
 
     plt.figure()
@@ -92,6 +109,8 @@ def run_system():
     plt.tight_layout()
     plt.savefig("hdd_chart.png")
     print("Chart saved as hdd_chart.png")
+
+    send_telegram(msg)
 
 if __name__ == "__main__":
     run_system()
