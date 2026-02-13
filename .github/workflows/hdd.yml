@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"   # 每天 UTC 00:00
+    - cron: "0 0 * * *"   # 每天 UTC 00:00 (你在 GMT+7 等於早上 7 點)
 
 concurrency:
   group: hdd-daily
@@ -15,18 +15,19 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync with origin/main (avoid fetch-first issues)
+      # ✅ 先同步遠端，避免 push 被 reject
+      - name: Sync with origin/main (rebase)
         run: |
           set -eux
-          git fetch origin main
-          git reset --hard origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,13 +44,11 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          LAT: ${{ secrets.LAT }}
-          LON: ${{ secrets.LON }}
-          BASE_F: "65"
-          FORECAST_DAYS: "30"
-          # 可選（你之後要加也行）
-          STORAGE_PRICE: ${{ secrets.STORAGE_PRICE }}
-          NG_PRICE: ${{ secrets.NG_PRICE }}
+          NG_PRICE: ${{ secrets.NG_PRICE }}           # 可選
+          STORAGE_PRICE: ${{ secrets.STORAGE_PRICE }} # 可選
+          LAT: ${{ secrets.LAT }}                     # 可選
+          LON: ${{ secrets.LON }}                     # 可選
+          BASE_F: ${{ secrets.BASE_F }}               # 可選
         run: |
           set -eux
           python hdd_system.py
@@ -57,9 +56,6 @@ jobs:
       - name: Commit & push results (csv + chart)
         run: |
           set -eux
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add ng_hdd_data.csv hdd_chart.png
 
           if git diff --cached --quiet; then
