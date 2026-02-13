@@ -38,14 +38,12 @@ jobs:
           set -eux
           python hdd_system.py
 
-      - name: Commit & push results
+           - name: Commit & push results
         run: |
           set -eux
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git status
 
           git add ng_hdd_data.csv hdd_chart.png
 
@@ -56,9 +54,7 @@ jobs:
 
           git commit -m "Daily HDD update"
 
-          # ✅ 先抓遠端最新，再把自己的 commit 疊上去
-          git fetch origin main
-          git rebase origin/main
+          # 🔥 用 pull --rebase 取代 fetch + rebase（比較穩）
+          git pull --rebase origin main
 
-          # ✅ 推回 main
-          git push origin HEAD:main
+          git push origin main
