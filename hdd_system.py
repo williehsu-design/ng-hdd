@@ -1,137 +1,78 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-import sys
-import json
 import time
-import math
-import datetime as dt
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
 import requests
 import pandas as pd
+from datetime import datetime, timedelta, timezone
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 # =========================
-# Config
+# CONFIG
 # =========================
-LAT = float(os.getenv("LAT", "40.7128"))
-LON = float(os.getenv("LON", "-74.0060"))
 BASE_F = float(os.getenv("BASE_F", "65.0"))
 
-CSV_PATH = os.getenv("CSV_PATH", "ng_hdd_data.csv")
-CHART_PATH = os.getenv("CHART_PATH", "hdd_chart.png")
+LAT = float(os.getenv("LAT", "40.7128"))
+LON = float(os.getenv("LON", "-74.0060"))
 
-# Rolling windows
-WIN_15 = int(os.getenv("WIN_15", "15"))
-WIN_30 = int(os.getenv("WIN_30", "30"))
+CSV_FILE = os.getenv("CSV_FILE", "ng_hdd_data.csv")
+CHART_FILE = os.getenv("CHART_FILE", "hdd_cdd_chart.png")
 
-# Telegram
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-# Optional prices
-# (你可以在 GitHub Actions secrets 或 variables 設 NG_PRICE / STORAGE_PRICE)
-NG_PRICE = os.getenv("NG_PRICE", "").strip()
-STORAGE_PRICE = os.getenv("STORAGE_PRICE", "").strip()
+WIN15 = 15
+WIN30 = 30
 
-# If you still want “forecast look-ahead” you can add another flow later.
-# This version focuses on stable "past observed" HDD to avoid forecast_days limits.
-
+USER_AGENT = "hdd-cdd-bot/1.0"
 
 # =========================
-# Helpers
+# HELPERS
 # =========================
-def utc_today() -> dt.date:
-    return dt.datetime.utcnow().date()
-
-
-def to_float_or_none(x: str) -> Optional[float]:
-    try:
-        if x is None or str(x).strip() == "":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 25) -> requests.Response:
+def retry_get(url: str, params: dict, tries: int = 4, timeout: int = 30) -> requests.Response:
     last_err = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code >= 400:
-                # include response body for easier debugging
-                raise RuntimeError(f"{r.status_code} {r.reason}: {r.text}")
+            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": USER_AGENT})
+            if r.status_code in (502, 503, 504):
+                time.sleep(1.5 ** i)
+                continue
+            r.raise_for_status()
             return r
         except Exception as e:
             last_err = e
-            sleep_s = 1.0 + i * 1.3
-            print(f"[WARN] HTTP attempt {i+1}/{tries} failed: {e}. sleep {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-    raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}")
+            time.sleep(1.5 ** i)
+    raise RuntimeError(f"HTTP failed after {tries} tries: {last_err}")
 
+def hdd(temp_f: float) -> float:
+    return max(0.0, BASE_F - temp_f)
 
-def compute_hdd_series(mean_temps_f: List[float], base_f: float) -> List[float]:
-    # HDD = max(0, base - temp)
-    return [max(0.0, base_f - float(t)) for t in mean_temps_f]
+def cdd(temp_f: float) -> float:
+    return max(0.0, temp_f - BASE_F)
 
+def utc_today_date() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
-def weighted_avg(values: List[float]) -> float:
-    # Linear weights: older low, newer high (1..N)
-    n = len(values)
-    if n <= 0:
-        return float("nan")
-    weights = list(range(1, n + 1))
-    s = sum(v * w for v, w in zip(values, weights))
-    w = sum(weights)
-    return s / w
-
-
-def signal_from_delta(delta: float) -> str:
-    # You can tune these thresholds
-    if delta >= 10:
-        return "🔥 Bullish"
-    if delta <= -10:
-        return "🧊 Bearish"
-    return "😐 Neutral"
-
-
-def fmt(x: Optional[float], nd: int = 2) -> str:
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-        return "—"
-    return f"{x:.{nd}f}"
-
-
-# =========================
-# Weather Fetch (ARCHIVE)
-# =========================
-def fetch_daily_mean_f_archive(lat: float, lon: float, days: int) -> Tuple[List[str], List[float]]:
+def fetch_past_daily_mean_f(days: int = 35):
     """
-    Fetch past 'days' daily mean temperatures (F) using Open-Meteo Archive API.
-    End at yesterday UTC (archive is stable).
+    Use Open-Meteo ARCHIVE API for stable past observed daily mean temps.
+    We'll fetch up to yesterday (UTC) to avoid partial-day issues.
     """
-    if days <= 0:
-        raise ValueError("days must be > 0")
-
-    end_date = utc_today() - dt.timedelta(days=1)
-    start_date = end_date - dt.timedelta(days=days - 1)
+    end_date = (datetime.now(timezone.utc).date() - timedelta(days=1))
+    start_date = end_date - timedelta(days=days - 1)
 
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
-        "latitude": lat,
-        "longitude": lon,
+        "latitude": LAT,
+        "longitude": LON,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "daily": "temperature_2m_mean",
         "temperature_unit": "fahrenheit",
         "timezone": "UTC",
     }
-
-    r = retry_get(url, params=params, tries=3, timeout=25)
+    r = retry_get(url, params=params)
     data = r.json()
 
     daily = data.get("daily", {})
@@ -139,197 +80,141 @@ def fetch_daily_mean_f_archive(lat: float, lon: float, days: int) -> Tuple[List[
     temps = daily.get("temperature_2m_mean", [])
 
     if not dates or not temps or len(dates) != len(temps):
-        raise RuntimeError(f"Archive API returned unexpected payload: {json.dumps(data)[:400]}")
+        raise RuntimeError(f"Unexpected archive payload: {str(data)[:300]}")
 
     return dates, [float(t) for t in temps]
 
-
-# =========================
-# Telegram
-# =========================
-def tg_send_message(text: str) -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[INFO] Telegram not configured (missing TG_BOT_TOKEN/TG_CHAT_ID). Skip send_message.")
+def send_telegram_message(text: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram skipped: TG_BOT_TOKEN/TG_CHAT_ID not set.")
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, data=payload, timeout=25)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text}")
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    r = requests.post(url, json=payload, timeout=30)
+    r.raise_for_status()
 
-
-def tg_send_photo(photo_path: str, caption: str = "") -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[INFO] Telegram not configured (missing TG_BOT_TOKEN/TG_CHAT_ID). Skip send_photo.")
+def send_telegram_photo(photo_path: str, caption: str = ""):
+    if not TG_TOKEN or not TG_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    if not os.path.exists(photo_path):
+        print(f"Chart missing: {photo_path}")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     with open(photo_path, "rb") as f:
         files = {"photo": f}
         data = {"chat_id": TG_CHAT_ID, "caption": caption}
         r = requests.post(url, data=data, files=files, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Telegram sendPhoto failed: {r.status_code} {r.text}")
+    r.raise_for_status()
 
-
-# =========================
-# Chart
-# =========================
-def plot_chart(df: pd.DataFrame, out_path: str) -> None:
-    # Plot last 90 rows (if exists)
-    view = df.tail(90).copy()
-
+def make_chart(df: pd.DataFrame):
+    dfx = df.tail(90).copy()
     plt.figure(figsize=(10.5, 5.2))
-    plt.plot(view["date"], view["hdd_15d"], label="HDD 15D (weighted)")
-    plt.plot(view["date"], view["hdd_30d"], label="HDD 30D (weighted)")
-
+    plt.plot(dfx["date"], dfx["hdd_15d"], label="HDD 15D")
+    plt.plot(dfx["date"], dfx["cdd_15d"], label="CDD 15D")
+    plt.plot(dfx["date"], dfx["ndd_15d"], label="NDD 15D (CDD-HDD)")
     plt.xticks(rotation=45, ha="right")
-    plt.title("HDD Trend (15D / 30D weighted)")
-    plt.xlabel("Date (UTC)")
-    plt.ylabel("HDD")
+    plt.title("Degree Days Trend (15D)")
+    plt.xlabel("Run Date (UTC)")
+    plt.ylabel("Degree Days (sum)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_path, dpi=160)
+    plt.savefig(CHART_FILE, dpi=160)
     plt.close()
 
+def run_system():
+    run_date = utc_today_date()
 
-# =========================
-# Main
-# =========================
-def run_system() -> None:
-    # We need enough days to compute both windows.
-    need_days = max(WIN_15, WIN_30)
+    # Fetch past temps
+    dates, temps = fetch_past_daily_mean_f(days=35)
 
-    try:
-        dates, temps = fetch_daily_mean_f_archive(LAT, LON, need_days)
-    except Exception as e:
-        # Fallback: if archive fails, try to continue from existing CSV (if any)
-        print(f"[ERROR] Weather fetch failed: {e}")
-        if os.path.exists(CSV_PATH):
-            print("[WARN] Using historical CSV only (no new update).")
-            df = pd.read_csv(CSV_PATH)
-            if df.empty:
-                raise RuntimeError("CSV exists but empty; cannot fallback.")
-            # Still re-render chart & telegram using last row
-            plot_chart(df, CHART_PATH)
-            last = df.iloc[-1].to_dict()
-            send_summary(df, last, chart_path=CHART_PATH)
-            return
-        raise RuntimeError("Weather API failed and no historical HDD in CSV to fallback.")
+    daily_hdd = [hdd(t) for t in temps]
+    daily_cdd = [cdd(t) for t in temps]
 
-    hdds = compute_hdd_series(temps, BASE_F)
+    # last N days sums
+    hdd_15 = sum(daily_hdd[-WIN15:])
+    hdd_30 = sum(daily_hdd[-WIN30:])
+    cdd_15 = sum(daily_cdd[-WIN15:])
+    cdd_30 = sum(daily_cdd[-WIN30:])
 
-    # Build a small dataframe for the fetched window
-    dff = pd.DataFrame({
-        "date": dates,
-        "temp_mean_f": temps,
-        "hdd": hdds,
-    })
+    ndd_15 = cdd_15 - hdd_15
+    ndd_30 = cdd_30 - hdd_30
 
-    # Compute weighted windows
-    # For each date i, use last WIN_N values up to i
-    def rolling_weighted(series: List[float], win: int) -> List[float]:
-        out = []
-        for i in range(len(series)):
-            start = max(0, i - win + 1)
-            chunk = series[start:i+1]
-            out.append(weighted_avg(chunk))
-        return out
-
-    dff["hdd_15d"] = rolling_weighted(dff["hdd"].tolist(), WIN_15)
-    dff["hdd_30d"] = rolling_weighted(dff["hdd"].tolist(), WIN_30)
-
-    # Load existing CSV, append/merge by date
-    if os.path.exists(CSV_PATH):
-        old = pd.read_csv(CSV_PATH)
-        if "date" in old.columns:
-            df = pd.concat([old, dff], ignore_index=True)
-            df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
-        else:
-            df = dff.copy()
+    # Load/upgrade CSV
+    if os.path.exists(CSV_FILE):
+        df = pd.read_csv(CSV_FILE)
     else:
-        df = dff.copy()
+        df = pd.DataFrame(columns=[
+            "date",
+            "hdd_15d","hdd_30d",
+            "cdd_15d","cdd_30d",
+            "ndd_15d","ndd_30d",
+            "delta_hdd_15d","delta_cdd_15d","delta_ndd_15d"
+        ])
 
-    # Compute deltas vs yesterday (previous row)
-    df["delta_15"] = df["hdd_15d"].diff()
-    df["delta_30"] = df["hdd_30d"].diff()
+    for col in [
+        "date",
+        "hdd_15d","hdd_30d",
+        "cdd_15d","cdd_30d",
+        "ndd_15d","ndd_30d",
+        "delta_hdd_15d","delta_cdd_15d","delta_ndd_15d"
+    ]:
+        if col not in df.columns:
+            df[col] = 0.0 if col != "date" else ""
 
-    # Signals
-    df["signal_15"] = df["delta_15"].apply(lambda x: signal_from_delta(x) if pd.notna(x) else "—")
-    df["signal_30"] = df["delta_30"].apply(lambda x: signal_from_delta(x) if pd.notna(x) else "—")
-
-    # Prices (optional)
-    ng_price = to_float_or_none(NG_PRICE)
-    storage_price = to_float_or_none(STORAGE_PRICE)
-    df["ng_price"] = ng_price if ng_price is not None else ""
-    df["storage_price"] = storage_price if storage_price is not None else ""
-
-    # A simple combined index (optional):
-    # combo = HDD_15D * NG_PRICE + STORAGE_PRICE
-    # (你想要不同公式我再幫你換)
-    if ng_price is not None or storage_price is not None:
-        df["combo_index"] = (
-            (df["hdd_15d"] * (ng_price if ng_price is not None else 0.0))
-            + (storage_price if storage_price is not None else 0.0)
-        )
+    # Previous values
+    if len(df) > 0:
+        prev_h15 = float(df.iloc[-1].get("hdd_15d", 0.0))
+        prev_c15 = float(df.iloc[-1].get("cdd_15d", 0.0))
+        prev_n15 = float(df.iloc[-1].get("ndd_15d", 0.0))
     else:
-        df["combo_index"] = ""
+        prev_h15 = prev_c15 = prev_n15 = 0.0
 
-    # Save CSV
-    df.to_csv(CSV_PATH, index=False)
+    delta_h15 = hdd_15 - prev_h15
+    delta_c15 = cdd_15 - prev_c15
+    delta_n15 = ndd_15 - prev_n15
 
-    # Plot chart
-    plot_chart(df, CHART_PATH)
+    new_row = {
+        "date": run_date,
+        "hdd_15d": round(hdd_15, 3),
+        "hdd_30d": round(hdd_30, 3),
+        "cdd_15d": round(cdd_15, 3),
+        "cdd_30d": round(cdd_30, 3),
+        "ndd_15d": round(ndd_15, 3),
+        "ndd_30d": round(ndd_30, 3),
+        "delta_hdd_15d": round(delta_h15, 3),
+        "delta_cdd_15d": round(delta_c15, 3),
+        "delta_ndd_15d": round(delta_n15, 3),
+    }
 
-    # Telegram summary
-    last = df.iloc[-1].to_dict()
-    send_summary(df, last, chart_path=CHART_PATH)
+    if (df["date"].astype(str) == run_date).any():
+        df.loc[df["date"].astype(str) == run_date, list(new_row.keys())] = list(new_row.values())
+    else:
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
+    df.to_csv(CSV_FILE, index=False)
 
-def send_summary(df: pd.DataFrame, last_row: dict, chart_path: str) -> None:
-    d = str(last_row.get("date", "—"))
-    h15 = last_row.get("hdd_15d", None)
-    h30 = last_row.get("hdd_30d", None)
-    d15 = last_row.get("delta_15", None)
-    d30 = last_row.get("delta_30", None)
-    s15 = str(last_row.get("signal_15", "—"))
-    s30 = str(last_row.get("signal_30", "—"))
+    make_chart(df)
 
-    ng_price = last_row.get("ng_price", "")
-    storage_price = last_row.get("storage_price", "")
-    combo = last_row.get("combo_index", "")
+    regime = "❄️ HDD-dominant" if ndd_15 < 0 else "🔥 CDD-dominant"
 
-    # Cleaner, easier-to-read message (HTML)
-    lines = []
-    lines.append(f"<b>✅ HDD Update</b> <code>{d}</code>")
-    lines.append("")
-    lines.append(f"• <b>15D HDD (weighted)</b>: <b>{fmt(h15)}</b>  (Δ {fmt(d15)})  {s15}")
-    lines.append(f"• <b>30D HDD (weighted)</b>: <b>{fmt(h30)}</b>  (Δ {fmt(d30)})  {s30}")
+    msg = (
+        f"📊 HDD/CDD Daily Report ({run_date} UTC)\n"
+        f"────────────────────────\n"
+        f"15D HDD: {hdd_15:.2f}   (Δ {delta_h15:+.2f})\n"
+        f"15D CDD: {cdd_15:.2f}   (Δ {delta_c15:+.2f})\n"
+        f"15D NDD: {ndd_15:.2f}   (Δ {delta_n15:+.2f})\n"
+        f"\n"
+        f"30D HDD: {hdd_30:.2f}\n"
+        f"30D CDD: {cdd_30:.2f}\n"
+        f"30D NDD: {ndd_30:.2f}\n"
+        f"\n"
+        f"Regime: {regime}"
+    )
 
-    # Optional price block
-    if str(ng_price).strip() != "" or str(storage_price).strip() != "":
-        lines.append("")
-        lines.append("<b>Prices</b>")
-        lines.append(f"• NG: <b>{ng_price if str(ng_price).strip()!='' else '—'}</b>")
-        lines.append(f"• Storage: <b>{storage_price if str(storage_price).strip()!='' else '—'}</b>")
-        if str(combo).strip() != "":
-            try:
-                combo_f = float(combo)
-                lines.append(f"• <b>Combo index</b> (HDD15*NG + Storage): <b>{combo_f:.3f}</b>")
-            except Exception:
-                lines.append(f"• <b>Combo index</b>: <b>{combo}</b>")
+    print(msg)
 
-    msg = "\n".join(lines)
-
-    # Send message + chart
-    tg_send_message(msg)
-    if os.path.exists(chart_path):
-        tg_send_photo(chart_path, caption=f"HDD Trend (15D/30D) {d}")
-
+    send_telegram_message(msg)
+    send_telegram_photo(CHART_FILE, caption=f"📈 Trend (HDD/CDD/NDD 15D) • {run_date} UTC")
 
 if __name__ == "__main__":
     run_system()
