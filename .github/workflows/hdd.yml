@@ -17,6 +17,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,34 +35,32 @@ jobs:
 
       - name: Install deps
         run: |
-          set -eux
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script (also sends Telegram)
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+      - name: Debug env
         run: |
-          set -eux
-          python hdd_system.py
+          python - << 'PY'
+          import os
+          print("TELEGRAM_TOKEN set? ", bool(os.getenv("TELEGRAM_TOKEN")))
+          print("TELEGRAM_CHAT_ID set? ", bool(os.getenv("TELEGRAM_CHAT_ID")))
+          print("EIA_API_KEY set? ", bool(os.getenv("EIA_API_KEY")))
+          PY
+
+      - name: Run script (also sends Telegram)
+        run: python hdd_system.py
 
       - name: Commit & push results (csv + chart)
         run: |
-          set -eux
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add ng_hdd_data.csv hdd_cdd_chart.png
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
           git commit -m "Daily HDD/CDD/Storage update"
-
-          git fetch origin main
-          git rebase origin/main
-          git push origin HEAD:main
+          git pull --rebase
+          git push
