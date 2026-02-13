@@ -1,403 +1,477 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-HDD/CDD Daily Monitor
-- Fetch weather daily mean temp (Open-Meteo) with past_days + forecast_days (forecast_days max 16)
-- Compute HDD/CDD (base 65F)
-- Compute 15D and 30D weighted (more weight to nearer days)
-- Save CSV: ng_hdd_data.csv
-- Plot chart: hdd_chart.png
-- Send Telegram message + chart (sendMessage + sendPhoto)
-Secrets:
-  - TG_BOT_TOKEN
-  - TG_CHAT_ID
-"""
+HDD/CDD Monitor (15D / 30D) + Telegram + Trend Chart + EIA Storage helper
 
-from __future__ import annotations
+- Weather: Open-Meteo daily temperature_2m_mean (F)
+  * Uses past_days + forecast_days
+  * NOTE: Open-Meteo 'forecast_days' has an upper limit (often 16). We respect it.
+- Metrics:
+  * Daily HDD = max(0, BASE_F - TmeanF)
+  * Daily CDD = max(0, TmeanF - BASE_F)
+  * Weighted 15D / 30D using linear weights (recent days weigh more)
+- Storage:
+  * Pulls EIA Weekly Natural Gas Storage Report JSON
+  * Uses EIA release_date as truth (holiday weeks shift automatically)
+- Output:
+  * Append row to CSV
+  * Generate trend chart PNG
+  * Send Telegram text + photo
+"""
 
 import os
 import sys
+import json
 import time
 import math
-import json
+import csv
+import datetime as dt
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
 
 # =========================
-# Config
+# User-configurable settings
 # =========================
-LAT = float(os.getenv("LAT", "40.7128"))        # NYC default
+
+# Location (example: New York area). Change if needed.
+LAT = float(os.getenv("LAT", "40.7128"))
 LON = float(os.getenv("LON", "-74.0060"))
-TEMP_UNIT = os.getenv("TEMP_UNIT", "fahrenheit")  # "fahrenheit" or "celsius"
+
+# Degree-day base temperature (F)
 BASE_F = float(os.getenv("BASE_F", "65.0"))
 
-# Open-Meteo forecast API limits: forecast_days max 16
-PAST_DAYS = int(os.getenv("PAST_DAYS", "30"))         # history to include (used for chart context)
-FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "16")) # must be <= 16
+# Weather window controls
+# We want 30D metric. We'll build it using (past_days + forecast_days) >= 30.
+# Open-Meteo often limits forecast_days <= 16, so we default forecast_days=16, past_days=20 (36 total).
+FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "16"))  # keep <= 16 to avoid 400 errors
+PAST_DAYS = int(os.getenv("PAST_DAYS", "20"))          # adjust so past+forecast >= 30
 
+# Output files
 CSV_PATH = os.getenv("CSV_PATH", "ng_hdd_data.csv")
 CHART_PATH = os.getenv("CHART_PATH", "hdd_chart.png")
 
+# Telegram (GitHub Secrets)
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-# Telegram options
-TG_PARSE_MODE = os.getenv("TG_PARSE_MODE", "")  # leave empty to avoid formatting surprises
-TG_DISABLE_WEB_PAGE_PREVIEW = True
+# EIA storage JSON (official)
+EIA_WNGSR_JSON = "https://ir.eia.gov/ngs/wngsr.json"
 
-# Behavior
-HTTP_TIMEOUT = 25
-HTTP_RETRIES = 3
-RETRY_SLEEP_BASE = 1.0
+# Open-Meteo API
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 # =========================
 # Helpers
 # =========================
-def _now_utc_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
-def retry_get(url: str, params: Dict, tries: int = HTTP_RETRIES, timeout: int = HTTP_TIMEOUT) -> requests.Response:
+def today_utc_date_str() -> str:
+    return utcnow().date().isoformat()
+
+def sleep_backoff(attempt: int) -> None:
+    # attempt starts at 1
+    base = 0.8
+    t = base * (1.8 ** (attempt - 1))
+    time.sleep(min(t, 6.0))
+
+def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requests.Response:
     last_err = None
     for i in range(1, tries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code >= 400:
-                # include response json if exists for easier debugging
+                # Print body to help debugging
                 try:
-                    msg = r.json()
+                    body = r.text[:300]
                 except Exception:
-                    msg = r.text[:300]
-                raise requests.HTTPError(f"{r.status_code} {r.reason}: {msg}", response=r)
+                    body = "<no body>"
+                print(f"[WARN] HTTP attempt {i}/{tries} failed: {r.status_code} {r.reason}: {body}")
+                r.raise_for_status()
             return r
         except Exception as e:
             last_err = e
-            sleep_s = RETRY_SLEEP_BASE * (1.0 + i * 0.5)
-            print(f"[WARN] HTTP attempt {i}/{tries} failed: {e}. sleep {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-    raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}")
+            if i < tries:
+                sleep_backoff(i)
+            else:
+                raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}") from last_err
 
-
-def safe_float(x, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def weighted_avg(values: List[float], weights: List[float]) -> float:
-    if not values or not weights or len(values) != len(weights):
-        return 0.0
-    s_w = sum(weights)
-    if s_w == 0:
-        return 0.0
-    return sum(v * w for v, w in zip(values, weights)) / s_w
-
-
-def make_linear_weights(n: int) -> List[float]:
-    # 1..n (nearest day gets larger weight if we order oldest->newest)
+def linear_weights(n: int) -> List[float]:
+    """1..n normalized (recent = larger if list is chronological)"""
     if n <= 0:
         return []
-    return list(range(1, n + 1))
+    w = list(range(1, n + 1))
+    s = float(sum(w))
+    return [x / s for x in w]
+
+def weighted_sum(values: List[float]) -> float:
+    w = linear_weights(len(values))
+    return float(sum(v * wi for v, wi in zip(values, w)))
+
+def dd_from_temp(base_f: float, tmean_f: float) -> Tuple[float, float]:
+    hdd = max(0.0, base_f - tmean_f)
+    cdd = max(0.0, tmean_f - base_f)
+    return hdd, cdd
 
 
 # =========================
-# Weather + HDD/CDD
+# Weather
 # =========================
-def fetch_daily_mean_temp(lat: float, lon: float, past_days: int, forecast_days: int, temp_unit: str) -> Tuple[List[str], List[float]]:
-    """
-    Uses Open-Meteo Forecast API:
-      - daily=temperature_2m_mean
-      - past_days=...
-      - forecast_days=... (max 16)
-    """
-    if forecast_days > 16:
-        raise ValueError("FORECAST_DAYS must be <= 16 due to Open-Meteo API limitation.")
 
-    url = "https://api.open-meteo.com/v1/forecast"
+def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: int) -> Tuple[List[str], List[float]]:
+    """
+    Returns (dates[], tmean_f[]) in UTC-date strings, from past_days back through forecast_days forward.
+    We request timezone=UTC so dates are stable and NOT affected by US DST.
+    """
     params = {
         "latitude": lat,
         "longitude": lon,
         "daily": "temperature_2m_mean",
-        "temperature_unit": temp_unit,
-        "past_days": past_days,
-        "forecast_days": forecast_days,
+        "temperature_unit": "fahrenheit",
         "timezone": "UTC",
+        "past_days": str(past_days),
+        "forecast_days": str(forecast_days),
     }
-
-    r = retry_get(url, params=params, tries=HTTP_RETRIES, timeout=HTTP_TIMEOUT)
-    data = r.json()
-
-    daily = data.get("daily", {})
+    r = retry_get(OPEN_METEO_URL, params=params, tries=3, timeout=25)
+    j = r.json()
+    daily = j.get("daily", {})
     dates = daily.get("time", [])
     temps = daily.get("temperature_2m_mean", [])
-
     if not dates or not temps or len(dates) != len(temps):
-        raise RuntimeError(f"Unexpected weather payload: {json.dumps(data)[:400]}")
-
-    temps_f = [safe_float(t) for t in temps]
-    return dates, temps_f
+        raise RuntimeError(f"Weather payload invalid: dates={len(dates)} temps={len(temps)}")
+    return dates, [float(x) for x in temps]
 
 
-def compute_hdd_cdd_series(temps_f: List[float], base_f: float) -> Tuple[List[float], List[float]]:
-    hdd = [max(0.0, base_f - t) for t in temps_f]
-    cdd = [max(0.0, t - base_f) for t in temps_f]
-    return hdd, cdd
+def compute_hdd_cdd_15_30(base_f: float, dates: List[str], temps_f: List[float]) -> dict:
+    """
+    Uses the latest 15 and 30 daily values from the (past+forecast) sequence.
+    Sequence is chronological in Open-Meteo (old -> new).
+    """
+    daily_hdd = []
+    daily_cdd = []
+    for t in temps_f:
+        h, c = dd_from_temp(base_f, t)
+        daily_hdd.append(h)
+        daily_cdd.append(c)
 
+    if len(daily_hdd) < 30:
+        raise RuntimeError(f"Need at least 30 days to compute 30D, got {len(daily_hdd)}")
 
-@dataclass
-class Metrics:
-    date: str
-    hdd15: float
-    hdd30: float
-    cdd15: float
-    cdd30: float
-    delta_hdd15: float
-    delta_hdd30: float
-    signal: str
+    h15 = daily_hdd[-15:]
+    h30 = daily_hdd[-30:]
+    c15 = daily_cdd[-15:]
+    c30 = daily_cdd[-30:]
 
-
-def derive_signal(delta_hdd15: float, delta_hdd30: float) -> str:
-    # Very simple heuristic: you can refine later
-    # Positive delta => colder => potentially bullish NG (more heating demand)
-    if delta_hdd15 >= 10 or delta_hdd30 >= 10:
-        return "🔥 Bullish (colder revision)"
-    if delta_hdd15 >= 3 or delta_hdd30 >= 3:
-        return "📈 Mild Bullish"
-    if delta_hdd15 <= -10 or delta_hdd30 <= -10:
-        return "🧊 Bearish (warmer revision)"
-    if delta_hdd15 <= -3 or delta_hdd30 <= -3:
-        return "📉 Mild Bearish"
-    return "😐 Neutral"
-
-
-def compute_metrics(dates: List[str], temps_f: List[float]) -> Metrics:
-    hdd, cdd = compute_hdd_cdd_series(temps_f, BASE_F)
-
-    # Use the MOST RECENT forecast window for 15/30 (from the end of the combined past+forecast series)
-    # We take last N days from the available series.
-    def w_metric(series: List[float], n: int) -> float:
-        n = min(n, len(series))
-        chunk = series[-n:]
-        w = make_linear_weights(n)  # oldest->newest within chunk
-        return weighted_avg(chunk, w)
-
-    hdd15 = w_metric(hdd, 15)
-    hdd30 = w_metric(hdd, 30)
-    cdd15 = w_metric(cdd, 15)
-    cdd30 = w_metric(cdd, 30)
-
-    today = dates[-1]  # last date in series
-
-    # For deltas, compare to yesterday's saved CSV if exists
-    prev_hdd15 = None
-    prev_hdd30 = None
-    if os.path.exists(CSV_PATH):
-        try:
-            df = pd.read_csv(CSV_PATH)
-            if len(df) > 0:
-                prev_hdd15 = safe_float(df.iloc[-1].get("hdd_15d"))
-                prev_hdd30 = safe_float(df.iloc[-1].get("hdd_30d"))
-        except Exception as e:
-            print(f"[WARN] Failed reading previous CSV for delta: {e}")
-
-    delta_hdd15 = (hdd15 - prev_hdd15) if prev_hdd15 is not None else 0.0
-    delta_hdd30 = (hdd30 - prev_hdd30) if prev_hdd30 is not None else 0.0
-
-    signal = derive_signal(delta_hdd15, delta_hdd30)
-
-    return Metrics(
-        date=today,
-        hdd15=hdd15,
-        hdd30=hdd30,
-        cdd15=cdd15,
-        cdd30=cdd30,
-        delta_hdd15=delta_hdd15,
-        delta_hdd30=delta_hdd30,
-        signal=signal,
-    )
-
-
-# =========================
-# Output: CSV + Chart
-# =========================
-def upsert_csv(m: Metrics) -> None:
-    row = {
-        "date": m.date,
-        "hdd_15d": round(m.hdd15, 3),
-        "hdd_30d": round(m.hdd30, 3),
-        "cdd_15d": round(m.cdd15, 3),
-        "cdd_30d": round(m.cdd30, 3),
-        "delta_hdd_15d": round(m.delta_hdd15, 3),
-        "delta_hdd_30d": round(m.delta_hdd30, 3),
-        "signal": m.signal,
-        "updated_utc": _now_utc_str(),
+    return {
+        "daily_dates": dates,
+        "daily_hdd": daily_hdd,
+        "daily_cdd": daily_cdd,
+        "hdd_15d": weighted_sum(h15),
+        "hdd_30d": weighted_sum(h30),
+        "cdd_15d": weighted_sum(c15),
+        "cdd_30d": weighted_sum(c30),
     }
 
-    if os.path.exists(CSV_PATH):
+
+# =========================
+# EIA Storage (C1)
+# =========================
+
+@dataclass
+class StorageInfo:
+    release_date_utc: Optional[dt.datetime]  # based on EIA JSON release_date (date-only effectively)
+    current_week: Optional[str]             # e.g. "2026-02-06"
+    total_bcf: Optional[float]              # Lower 48 total (bcf)
+    net_change_bcf: Optional[float]         # calculated net_change in JSON
+    fiveyr_avg_bcf: Optional[float]         # calculated 5yr-avg
+    ok: bool
+    reason: str
+
+def fetch_eia_storage() -> StorageInfo:
+    """
+    Pull EIA WNGSR JSON and return L48 total + net change + release date.
+    Holiday weeks are already handled by EIA release schedule: the JSON updates on the actual release.
+    """
+    try:
+        r = retry_get(EIA_WNGSR_JSON, params={}, tries=3, timeout=25)
+        j = r.json()
+
+        release_date_str = j.get("release_date")  # e.g. "2026-Feb-12 00:00:00"
+        release_dt_utc = None
+        if release_date_str:
+            # release_date in JSON is not explicitly tz; treat it as UTC date boundary (good enough for “new release” detection)
+            # We'll parse it as naive then attach UTC.
+            try:
+                release_dt_utc = dt.datetime.strptime(release_date_str, "%Y-%b-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                release_dt_utc = None
+
+        current_week = j.get("current_week")
+        series = j.get("series", [])
+
+        # Find "total lower 48 states"
+        total_series = None
+        for s in series:
+            if str(s.get("name", "")).strip().lower() == "total lower 48 states":
+                total_series = s
+                break
+
+        if not total_series:
+            return StorageInfo(release_dt_utc, current_week, None, None, None, False, "EIA JSON missing lower 48 series")
+
+        data = total_series.get("data", [])
+        calc = total_series.get("calculated", {})
+
+        total_bcf = None
+        if data and isinstance(data, list) and len(data) > 0:
+            # first item is [current_week_date, value]
+            total_bcf = float(data[0][1])
+
+        net_change = calc.get("net_change")
+        net_change_bcf = float(net_change) if net_change is not None else None
+
+        fiveyr = calc.get("5yr-avg")
+        fiveyr_avg_bcf = float(fiveyr) if fiveyr is not None else None
+
+        return StorageInfo(release_dt_utc, current_week, total_bcf, net_change_bcf, fiveyr_avg_bcf, True, "ok")
+    except Exception as e:
+        return StorageInfo(None, None, None, None, None, False, f"Storage fetch failed: {e}")
+
+
+# =========================
+# CSV + Chart
+# =========================
+
+def load_csv(path: str) -> pd.DataFrame:
+    if os.path.exists(path):
         try:
-            df = pd.read_csv(CSV_PATH)
+            return pd.read_csv(path)
         except Exception:
-            df = pd.DataFrame()
-    else:
-        df = pd.DataFrame()
+            pass
+    return pd.DataFrame(columns=[
+        "run_utc",
+        "hdd_15d", "hdd_30d",
+        "cdd_15d", "cdd_30d",
+        "storage_release_utc", "storage_week",
+        "storage_total_bcf", "storage_net_change_bcf", "storage_5yr_avg_bcf",
+    ])
 
-    # If last row is same date, overwrite; else append
-    if len(df) > 0 and str(df.iloc[-1].get("date")) == m.date:
-        df.iloc[-1] = row
-    else:
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+def append_row(df: pd.DataFrame, row: dict) -> pd.DataFrame:
+    df2 = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    # sort by run_utc if possible
+    if "run_utc" in df2.columns:
+        try:
+            df2["run_utc"] = pd.to_datetime(df2["run_utc"], utc=True)
+            df2 = df2.sort_values("run_utc").reset_index(drop=True)
+            df2["run_utc"] = df2["run_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return df2
 
-    df.to_csv(CSV_PATH, index=False)
-    print(f"[OK] CSV updated: {CSV_PATH}")
+def make_trend_chart(dates: List[str], daily_hdd: List[float], daily_cdd: List[float],
+                     title: str, out_path: str) -> None:
+    """
+    Plot last 30 points (or all if shorter) for daily HDD & CDD.
+    """
+    n = min(30, len(dates))
+    x = dates[-n:]
+    h = daily_hdd[-n:]
+    c = daily_cdd[-n:]
 
-
-def plot_chart(dates: List[str], temps_f: List[float], m: Metrics) -> None:
-    hdd, cdd = compute_hdd_cdd_series(temps_f, BASE_F)
-
-    # chart window: show last (PAST_DAYS + FORECAST_DAYS) but keep safe
-    n = len(dates)
-    x = list(range(n))
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(x, hdd, label="Daily HDD (base 65F)")
-    plt.plot(x, cdd, label="Daily CDD (base 65F)")
-
-    # annotate metrics
-    title = f"HDD/CDD Trend | {m.date} | 15D HDD={m.hdd15:.2f} / 30D HDD={m.hdd30:.2f} | 15D CDD={m.cdd15:.2f} / 30D CDD={m.cdd30:.2f}"
-    plt.title(title)
-    plt.xlabel("Day Index (Past -> Forecast)")
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, h, label=f"Daily HDD (base {BASE_F:.0f}F)")
+    plt.plot(x, c, label=f"Daily CDD (base {BASE_F:.0f}F)")
+    plt.xticks(rotation=45, ha="right")
     plt.ylabel("Degree Days")
+    plt.xlabel("Day (UTC)")
+    plt.title(title)
     plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    # label some x ticks
-    tick_idx = list(range(0, n, max(1, n // 8)))
-    plt.xticks(tick_idx, [dates[i] for i in tick_idx], rotation=30, ha="right")
-
     plt.tight_layout()
-    plt.savefig(CHART_PATH, dpi=160)
+    plt.savefig(out_path, dpi=150)
     plt.close()
-    print(f"[OK] Chart saved: {CHART_PATH}")
 
 
 # =========================
 # Telegram
 # =========================
-def tg_send_message(text: str) -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[INFO] Telegram secrets not set; skip sendMessage.")
+
+def tg_send_message(token: str, chat_id: str, text: str) -> None:
+    if not token or not chat_id:
+        print("[INFO] Telegram token/chat_id missing; skip message")
         return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    r = retry_get(url, params=payload, tries=3, timeout=25)
+    _ = r.text  # consume
 
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": TG_DISABLE_WEB_PAGE_PREVIEW,
-    }
-    if TG_PARSE_MODE:
-        payload["parse_mode"] = TG_PARSE_MODE
-
-    r = retry_get(url, params=payload, tries=HTTP_RETRIES, timeout=HTTP_TIMEOUT)
-    _ = r.json()
-    print("[OK] Telegram message sent.")
-
-
-def tg_send_photo(photo_path: str, caption: str = "") -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[INFO] Telegram secrets not set; skip sendPhoto.")
+def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str = "") -> None:
+    if not token or not chat_id:
+        print("[INFO] Telegram token/chat_id missing; skip photo")
         return
     if not os.path.exists(photo_path):
-        print(f"[WARN] Chart not found for Telegram: {photo_path}")
+        print("[WARN] Chart not found; skip photo")
         return
 
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto"
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
     with open(photo_path, "rb") as f:
         files = {"photo": f}
-        data = {
-            "chat_id": TG_CHAT_ID,
-            "caption": caption[:1024],  # Telegram caption limit
-        }
-        if TG_PARSE_MODE:
-            data["parse_mode"] = TG_PARSE_MODE
-        r = requests.post(url, data=data, files=files, timeout=HTTP_TIMEOUT)
-        if r.status_code >= 400:
+        data = {"chat_id": chat_id, "caption": caption}
+        # use requests directly (multipart)
+        for i in range(1, 4):
             try:
-                msg = r.json()
-            except Exception:
-                msg = r.text[:300]
-            raise RuntimeError(f"Telegram sendPhoto failed: {r.status_code} {r.reason}: {msg}")
-    print("[OK] Telegram photo sent.")
+                rr = requests.post(url, data=data, files=files, timeout=40)
+                if rr.status_code >= 400:
+                    print(f"[WARN] TG photo attempt {i}/3 failed: {rr.status_code} {rr.text[:200]}")
+                    rr.raise_for_status()
+                return
+            except Exception as e:
+                if i < 3:
+                    sleep_backoff(i)
+                else:
+                    raise RuntimeError(f"Telegram photo failed: {e}") from e
 
 
-def build_pretty_message(m: Metrics) -> str:
-    # nicer, easier-to-read formatting
-    arrow15 = "⬆️" if m.delta_hdd15 > 0 else ("⬇️" if m.delta_hdd15 < 0 else "➡️")
-    arrow30 = "⬆️" if m.delta_hdd30 > 0 else ("⬇️" if m.delta_hdd30 < 0 else "➡️")
+# =========================
+# Signal logic (simple)
+# =========================
 
-    lines = [
-        f"🛰️ HDD/CDD Update ({m.date})",
-        "",
-        f"🔥 HDD (base 65F)",
-        f"• 15D Weighted: {m.hdd15:.2f}  ({arrow15} Δ {m.delta_hdd15:+.2f})",
-        f"• 30D Weighted: {m.hdd30:.2f}  ({arrow30} Δ {m.delta_hdd30:+.2f})",
-        "",
-        f"🌤️ CDD (base 65F)",
-        f"• 15D Weighted: {m.cdd15:.2f}",
-        f"• 30D Weighted: {m.cdd30:.2f}",
-        "",
-        f"📌 Signal: {m.signal}",
-        "",
-        f"⏱ Updated: {_now_utc_str()}",
-    ]
-    return "\n".join(lines)
+def pick_signal(hdd15_delta: float) -> str:
+    """
+    Very simple: HDD up => Bullish (colder), down => Bearish (warmer)
+    """
+    if hdd15_delta > 2.0:
+        return "🔥 Bullish (colder revision)"
+    if hdd15_delta < -2.0:
+        return "🧊 Bearish (warmer revision)"
+    return "😐 Neutral"
+
+def fmt(x: Optional[float], nd=2) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "NA"
+    return f"{x:.{nd}f}"
 
 
 # =========================
 # Main
 # =========================
-def run() -> int:
-    # guard forecast_days limit
-    if FORECAST_DAYS > 16:
-        print("[WARN] FORECAST_DAYS > 16 is invalid for Open-Meteo; forcing to 16.")
-        fd = 16
+
+def run_system() -> None:
+    run_dt = utcnow()
+    run_utc_str = run_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1) Load history
+    df = load_csv(CSV_PATH)
+
+    # previous values (for delta)
+    prev_h15 = None
+    prev_h30 = None
+    prev_c15 = None
+    prev_c30 = None
+    if len(df) > 0:
+        try:
+            prev_h15 = float(df.iloc[-1]["hdd_15d"]) if "hdd_15d" in df.columns else None
+            prev_h30 = float(df.iloc[-1]["hdd_30d"]) if "hdd_30d" in df.columns else None
+            prev_c15 = float(df.iloc[-1]["cdd_15d"]) if "cdd_15d" in df.columns else None
+            prev_c30 = float(df.iloc[-1]["cdd_30d"]) if "cdd_30d" in df.columns else None
+        except Exception:
+            pass
+
+    # 2) Weather -> HDD/CDD
+    dates, temps = fetch_daily_mean_f(LAT, LON, past_days=PAST_DAYS, forecast_days=FORECAST_DAYS)
+    metrics = compute_hdd_cdd_15_30(BASE_F, dates, temps)
+
+    h15 = float(metrics["hdd_15d"])
+    h30 = float(metrics["hdd_30d"])
+    c15 = float(metrics["cdd_15d"])
+    c30 = float(metrics["cdd_30d"])
+
+    d_h15 = (h15 - prev_h15) if prev_h15 is not None else 0.0
+    d_h30 = (h30 - prev_h30) if prev_h30 is not None else 0.0
+
+    # 3) Storage (C1): fetch; decide “new release” by comparing release_date to last stored
+    storage = fetch_eia_storage()
+
+    last_storage_release = None
+    if "storage_release_utc" in df.columns and len(df) > 0:
+        try:
+            # keep as string in csv; parse back
+            s = str(df.iloc[-1].get("storage_release_utc", "")).strip()
+            if s and s != "nan":
+                last_storage_release = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            last_storage_release = None
+
+    storage_is_new = False
+    if storage.ok and storage.release_date_utc is not None:
+        if last_storage_release is None or storage.release_date_utc > last_storage_release:
+            storage_is_new = True
+
+    # 4) Append row
+    row = {
+        "run_utc": run_utc_str,
+        "hdd_15d": h15,
+        "hdd_30d": h30,
+        "cdd_15d": c15,
+        "cdd_30d": c30,
+        "storage_release_utc": storage.release_date_utc.isoformat().replace("+00:00", "Z") if storage.release_date_utc else "",
+        "storage_week": storage.current_week or "",
+        "storage_total_bcf": storage.total_bcf if storage.total_bcf is not None else "",
+        "storage_net_change_bcf": storage.net_change_bcf if storage.net_change_bcf is not None else "",
+        "storage_5yr_avg_bcf": storage.fiveyr_avg_bcf if storage.fiveyr_avg_bcf is not None else "",
+    }
+    df2 = append_row(df, row)
+    df2.to_csv(CSV_PATH, index=False)
+
+    # 5) Chart
+    chart_title = f"HDD/CDD Trend · {today_utc_date_str()} UTC"
+    make_trend_chart(metrics["daily_dates"], metrics["daily_hdd"], metrics["daily_cdd"], chart_title, CHART_PATH)
+
+    # 6) Telegram message (cleaner)
+    signal = pick_signal(d_h15)
+    lines = []
+    lines.append(f"📌 HDD/CDD Update ({today_utc_date_str()})")
+    lines.append("")
+    lines.append(f"🔥 HDD (base {BASE_F:.0f}F)")
+    lines.append(f" • 15D Weighted: {fmt(h15)}   (Δ {fmt(d_h15)})")
+    lines.append(f" • 30D Weighted: {fmt(h30)}   (Δ {fmt(d_h30)})")
+    lines.append("")
+    lines.append(f"🌤️ CDD (base {BASE_F:.0f}F)")
+    lines.append(f" • 15D Weighted: {fmt(c15)}")
+    lines.append(f" • 30D Weighted: {fmt(c30)}")
+    lines.append("")
+    if storage.ok and storage.total_bcf is not None:
+        tag = "🟢 NEW" if storage_is_new else "ℹ️"
+        lines.append(f"🧱 Storage (EIA WNGSR) {tag}")
+        lines.append(f" • Week: {storage.current_week or 'NA'}")
+        lines.append(f" • Total (L48): {fmt(storage.total_bcf, 0)} bcf")
+        if storage.net_change_bcf is not None:
+            lines.append(f" • Net change: {fmt(storage.net_change_bcf, 0)} bcf")
+        if storage.fiveyr_avg_bcf is not None:
+            lines.append(f" • 5Y avg: {fmt(storage.fiveyr_avg_bcf, 0)} bcf")
     else:
-        fd = FORECAST_DAYS
+        lines.append(f"🧱 Storage: NA ({storage.reason})")
+    lines.append("")
+    lines.append(f"📍 Signal: {signal}")
+    lines.append(f"⏱️ Updated: {run_utc_str} UTC")
 
-    # Fetch weather
-    dates, temps = fetch_daily_mean_temp(LAT, LON, PAST_DAYS, fd, TEMP_UNIT)
+    msg = "\n".join(lines)
 
-    # Metrics
-    m = compute_metrics(dates, temps)
+    tg_send_message(TG_BOT_TOKEN, TG_CHAT_ID, msg)
+    tg_send_photo(TG_BOT_TOKEN, TG_CHAT_ID, CHART_PATH, caption=f"📈 Trend (HDD/CDD) · {today_utc_date_str()} UTC")
 
-    # Save CSV + chart
-    upsert_csv(m)
-    plot_chart(dates, temps, m)
-
-    # Telegram: send text + chart
-    msg = build_pretty_message(m)
-    tg_send_message(msg)
-    tg_send_photo(CHART_PATH, caption=f"HDD/CDD Trend ({m.date})")
-
-    print("[OK] Done.")
-    return 0
+    print("[OK] Updated CSV + chart + Telegram sent")
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(run())
-    except Exception as e:
-        print(f"[FATAL] {e}")
-        sys.exit(1)
+    run_system()
