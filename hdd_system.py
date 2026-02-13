@@ -8,7 +8,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 BASE_F = 65.0
-FORECAST_DAYS = 30  # ✅ 一次抓 30 天，15D/30D 都能算
+
+FORECAST_DAYS = 15   # 未來預報天數
+PAST_DAYS = 15       # 往回抓的天數
+
 
 CITIES = {
     "New_York": (40.7128, -74.0060, 0.20),
