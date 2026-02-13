@@ -15,12 +15,20 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Sync with origin/main (before running)
+        run: |
+          set -eux
+          git pull --rebase origin main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,12 +41,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run
+      - name: Run script (also sends Telegram)
         run: |
           set -eux
           python hdd_system.py
 
-      - name: Commit & push results
+      - name: Commit & push results (csv + chart)
         run: |
           set -eux
           git config user.name "github-actions[bot]"
@@ -52,33 +60,4 @@ jobs:
           fi
 
           git commit -m "Daily HDD update"
-
-          # 先抓遠端最新，再把自己的 commit 疊上去
-          git fetch origin main
-          git rebase origin/main
-
-          # 推回 main
           git push origin HEAD:main
-
-      # ✅ 這步才是「發送 Telegram」
-      - name: Notify Telegram
-        if: always()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          set -eux
-          # 避免 secrets 沒設造成無聲失敗
-          if [ -z "${TG_BOT_TOKEN}" ] || [ -z "${TG_CHAT_ID}" ]; then
-            echo "Missing TG_BOT_TOKEN or TG_CHAT_ID secrets"
-            exit 1
-          fi
-
-          MSG="HDD Daily Run ✅
-Repo: $GITHUB_REPOSITORY
-Branch: $GITHUB_REF_NAME
-Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
-          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${MSG}"
