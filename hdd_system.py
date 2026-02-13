@@ -33,27 +33,55 @@ def fetch_daily_mean_f(lat, lon):
         f"?latitude={lat}&longitude={lon}"
         "&daily=temperature_2m_mean"
         "&temperature_unit=fahrenheit"
+        f"&past_days={PAST_DAYS}"
         f"&forecast_days={FORECAST_DAYS}"
         "&timezone=UTC"
     )
     r = requests.get(url, timeout=30)
     r.raise_for_status()
-    temps = r.json()["daily"]["temperature_2m_mean"]
-    if len(temps) < 30:
-        raise RuntimeError(f"Not enough forecast days returned: {len(temps)}")
-    return temps
+    daily = r.json()["daily"]
+    dates = daily["time"]
+    temps = daily["temperature_2m_mean"]
+    return dates, temps
 
 def hdd(temp_f):
     return max(0.0, BASE_F - temp_f)
 
+from datetime import date
+
 def compute_hdd_15_30():
+    today_str = str(date.today())
+
     total_15 = 0.0
     total_30 = 0.0
+
     for lat, lon, weight in CITIES.values():
-        temps = fetch_daily_mean_f(lat, lon)
+        dates, temps = fetch_daily_mean_f(lat, lon)
+
+        # 找「今天」在回傳陣列的位置
+        try:
+            i0 = dates.index(today_str)
+        except ValueError:
+            # 找不到就用中間當今天（保底）
+            i0 = PAST_DAYS
+
         hdds = [hdd(t) for t in temps]
-        total_15 += weight * sum(hdds[:15])
-        total_30 += weight * sum(hdds[:30])
+
+        # 15D：今天起算 15 天（i0 ~ i0+14）
+        if i0 + 15 > len(hdds):
+            raise RuntimeError("Not enough days for 15D window")
+        h15 = sum(hdds[i0:i0+15])
+
+        # 30D：過去14 + 今天 + 未來15（共30天）
+        start = i0 - PAST_DAYS
+        end = i0 + (30 - PAST_DAYS)  # i0+16
+        if start < 0 or end > len(hdds):
+            raise RuntimeError("Not enough days for 30D window")
+        h30 = sum(hdds[start:end])
+
+        total_15 += weight * h15
+        total_30 += weight * h30
+
     return total_15, total_30
 
 def signal_from_delta(delta):
