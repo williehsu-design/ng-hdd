@@ -47,7 +47,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_cdd_chart.png || true
+          git add ng_hdd_data.csv hdd_cdd_chart.png
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -55,7 +55,6 @@ jobs:
 
           git commit -m "Daily HDD/CDD/Storage update"
 
-          # 拉遠端最新再推（避免 fetch first）
           git fetch origin main
           git rebase origin/main
           git push origin HEAD:main
