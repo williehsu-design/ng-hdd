@@ -33,13 +33,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script (also sends Telegram)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          set -eux
-          python hdd_system.py
+       - name: Run script (also sends Telegram)
+  env:
+    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+  run: |
+    python hdd_system.py
 
       - name: Commit & push results (csv + chart)
         run: |
