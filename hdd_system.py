@@ -8,7 +8,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 BASE_F = 65.0
-FORECAST_DAYS = 15
+FORECAST_DAYS = 30  # ✅ 一次抓 30 天，15D/30D 都能算
 
 CITIES = {
     "New_York": (40.7128, -74.0060, 0.20),
@@ -20,9 +20,12 @@ CITIES = {
     "LA":       (34.0522, -118.2437, 0.10),
 }
 
-FILE = "ng_hdd_data.csv"
-CHART = "hdd_chart.png"
+DATA_FILE = "ng_hdd_data.csv"
+CHART_FILE = "hdd_chart.png"
+MARKET_FILE = "market_data.csv"
 
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 def fetch_daily_mean_f(lat, lon):
     url = (
@@ -35,107 +38,150 @@ def fetch_daily_mean_f(lat, lon):
     )
     r = requests.get(url, timeout=30)
     r.raise_for_status()
-    return r.json()["daily"]["temperature_2m_mean"]
-
+    temps = r.json()["daily"]["temperature_2m_mean"]
+    if len(temps) < 30:
+        raise RuntimeError(f"Not enough forecast days returned: {len(temps)}")
+    return temps
 
 def hdd(temp_f):
     return max(0.0, BASE_F - temp_f)
 
-
-def compute_15d_hdd():
-    total = 0.0
+def compute_hdd_15_30():
+    total_15 = 0.0
+    total_30 = 0.0
     for lat, lon, weight in CITIES.values():
         temps = fetch_daily_mean_f(lat, lon)
-        total += weight * sum(hdd(t) for t in temps)
-    return total
+        hdds = [hdd(t) for t in temps]
+        total_15 += weight * sum(hdds[:15])
+        total_30 += weight * sum(hdds[:30])
+    return total_15, total_30
 
-
-def signal_text(delta):
+def signal_from_delta(delta):
     if delta > 5:
-        return "🔥 Bullish (HDD 上修)"
+        return "🔥 Bullish Weather Revision"
     elif delta < -5:
-        return "❄ Bearish (HDD 下修)"
+        return "❄️ Bearish Weather Revision"
     else:
-        return "😐 Neutral"
+        return "🙂 Neutral"
 
+def load_market(today_str):
+    """
+    可選：若 repo 有 market_data.csv，抓今天最新一筆（或最後一筆）。
+    欄位：date,ng_price,storage_bcf
+    """
+    if not os.path.exists(MARKET_FILE):
+        return None
 
-def format_msg(today, today_val, delta):
-    return (
-        f"🧊 HDD 15D Update ({today})\n"
-        f"────────────────────\n"
-        f"15-Day Weighted HDD: {today_val:.2f}\n"
-        f"Δ vs Previous:       {delta:+.2f}\n"
-        f"Signal:              {signal_text(delta)}\n"
-    )
+    try:
+        m = pd.read_csv(MARKET_FILE)
+        if m.empty:
+            return None
+        # 先找今天，沒有就拿最後一筆
+        row = m[m["date"].astype(str) == today_str]
+        if not row.empty:
+            r = row.iloc[-1]
+        else:
+            r = m.iloc[-1]
+        return {
+            "ng_price": float(r["ng_price"]) if "ng_price" in r and pd.notna(r["ng_price"]) else None,
+            "storage_bcf": float(r["storage_bcf"]) if "storage_bcf" in r and pd.notna(r["storage_bcf"]) else None,
+        }
+    except Exception:
+        return None
 
-
-def tg_send_message(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def send_telegram_message(text):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram env not set. Skip sending message.")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": TG_CHAT_ID,
         "text": text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
-
-def tg_send_photo(token, chat_id, photo_path, caption=None):
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+def send_telegram_photo(photo_path, caption=""):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram env not set. Skip sending photo.")
+        return
+    if not os.path.exists(photo_path):
+        print(f"Chart not found: {photo_path}")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     with open(photo_path, "rb") as f:
         files = {"photo": f}
-        data = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption
+        data = {"chat_id": TG_CHAT_ID, "caption": caption}
         r = requests.post(url, data=data, files=files, timeout=60)
-    r.raise_for_status()
+        r.raise_for_status()
 
-
-def run_system():
-    today = str(date.today())
-    today_val = compute_15d_hdd()
-
-    if os.path.exists(FILE):
-        df = pd.read_csv(FILE)
-        prev = float(df.iloc[-1]["hdd_15d"])
-        delta = today_val - prev
-    else:
-        df = pd.DataFrame(columns=["date", "hdd_15d", "delta"])
-        delta = 0.0
-
-    new_row = pd.DataFrame([[today, today_val, delta]], columns=["date", "hdd_15d", "delta"])
-    df = pd.concat([df, new_row], ignore_index=True)
-    df.to_csv(FILE, index=False)
-
-    # chart
+def plot_chart(df):
     plt.figure()
     plt.plot(df["date"], df["hdd_15d"])
+    plt.plot(df["date"], df["hdd_30d"])
     plt.xticks(rotation=45)
-    plt.title("15-Day Weighted HDD")
+    plt.title("HDD Trend (15D vs 30D)")
     plt.tight_layout()
-    plt.savefig(CHART)
+    plt.savefig(CHART_FILE)
+    print(f"Chart saved as {CHART_FILE}")
 
-    # console
-    print(format_msg(today, today_val, delta))
-    print(f"Saved: {FILE}, {CHART}")
+def run_system():
+    today_str = str(date.today())
 
-    # telegram (optional)
-    token = os.getenv("TG_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TG_CHAT_ID", "").strip()
+    h15, h30 = compute_hdd_15_30()
 
-    if token and chat_id:
-        msg = format_msg(today, today_val, delta)
-        try:
-            tg_send_message(token, chat_id, msg)
-            # 圖片用很短 caption，避免重複一堆文字
-            tg_send_photo(token, chat_id, CHART, caption=f"📈 HDD Trend ({today})")
-            print("Telegram: sent message + chart")
-        except Exception as e:
-            # 你如果希望 Telegram 失敗就讓整個 Actions 失敗，把這行改成 raise
-            print(f"Telegram send failed: {e}")
+    if os.path.exists(DATA_FILE):
+        df = pd.read_csv(DATA_FILE)
+        prev15 = float(df.iloc[-1]["hdd_15d"])
+        prev30 = float(df.iloc[-1]["hdd_30d"])
+        d15 = h15 - prev15
+        d30 = h30 - prev30
     else:
-        print("Telegram skipped: TG_BOT_TOKEN / TG_CHAT_ID not set")
+        df = pd.DataFrame(columns=["date", "hdd_15d", "delta_15d", "hdd_30d", "delta_30d"])
+        d15 = 0.0
+        d30 = 0.0
 
+    new_row = pd.DataFrame(
+        [[today_str, h15, d15, h30, d30]],
+        columns=["date", "hdd_15d", "delta_15d", "hdd_30d", "delta_30d"],
+    )
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(DATA_FILE, index=False)
+
+    sig15 = signal_from_delta(d15)
+
+    # 可選市場資料
+    market = load_market(today_str)
+
+    # ✅ Telegram 文字更好懂（固定格式）
+    lines = []
+    lines.append(f"📊 <b>HDD Daily Report</b> ({today_str})")
+    lines.append("")
+    lines.append(f"15D Weighted HDD: <b>{h15:.2f}</b>  (Δ {d15:+.2f})")
+    lines.append(f"30D Weighted HDD: <b>{h30:.2f}</b>  (Δ {d30:+.2f})")
+    lines.append("")
+    lines.append(f"Signal (15D): <b>{sig15}</b>")
+
+    if market:
+        ngp = market.get("ng_price")
+        stg = market.get("storage_bcf")
+        lines.append("")
+        lines.append("📌 <b>Market</b>")
+        if ngp is not None:
+            lines.append(f"NG Price: <b>{ngp:.3f}</b>")
+        if stg is not None:
+            lines.append(f"Storage: <b>{stg:.0f}</b> bcf")
+
+    msg = "\n".join(lines)
+
+    print(msg.replace("<b>", "").replace("</b>", ""))
+
+    # 先畫圖，再送訊息+圖
+    plot_chart(df)
+    send_telegram_message(msg)
+    send_telegram_photo(CHART_FILE, caption=f"HDD Trend (15D vs 30D) • {today_str}")
 
 if __name__ == "__main__":
     run_system()
