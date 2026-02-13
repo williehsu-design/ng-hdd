@@ -3,7 +3,9 @@ name: HDD/CDD + Storage Monitor
 on:
   workflow_dispatch:
   schedule:
+    # 00Z 後跑一次（UTC 00:20）
     - cron: "20 0 * * *"
+    # 12Z 後跑一次（UTC 12:20）
     - cron: "20 12 * * *"
 
 concurrency:
@@ -33,12 +35,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script (also sends Telegram)
+      # ✅（可選）只驗證有沒有吃到 secrets，不會印出 key/token
+      - name: Debug env (safe)
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
+          python - << 'PY'
+          import os
+          print("TELEGRAM_TOKEN set?", bool(os.getenv("TELEGRAM_TOKEN")))
+          print("TELEGRAM_CHAT_ID set?", bool(os.getenv("TELEGRAM_CHAT_ID")))
+          print("EIA_API_KEY set?", bool(os.getenv("EIA_API_KEY")))
+          PY
+
+      - name: Run script (also sends Telegram)
+        env:
+          # ✅ 把你 repo secrets 的名字，映射成程式要吃的名字
+          TELEGRAM_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+        run: |
+          set -eux
           python hdd_system.py
 
       - name: Commit & push results (csv + chart)
@@ -47,7 +65,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_cdd_chart.png
+          # 你實際產出的檔名如果不同，這裡要一起改
+          git add ng_hdd_data.csv hdd_cdd_chart.png || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -55,6 +75,7 @@ jobs:
 
           git commit -m "Daily HDD/CDD/Storage update"
 
+          # 拉遠端最新再推（避免 fetch first）
           git fetch origin main
           git rebase origin/main
           git push origin HEAD:main
