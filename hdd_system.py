@@ -1,4 +1,9 @@
 import os
+import os
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+EIA_API_KEY = os.getenv("EIA_API_KEY")
 import json
 import time
 import math
