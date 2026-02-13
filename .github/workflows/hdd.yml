@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"  # 每天 UTC 00:00
+    - cron: "0 0 * * *"   # 每天 UTC 00:00
 
 concurrency:
   group: hdd-daily
@@ -15,18 +15,18 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout (full history)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ✅ 先把遠端 main 同步乾淨（這時候 repo 還沒被產檔弄髒）
+      # ✅ 先同步遠端（此時 repo 還是乾淨的）
       - name: Sync with origin/main
         run: |
           set -eux
-          git fetch origin main
-          git reset --hard origin/main
+          git pull --rebase origin main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,7 +39,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run system
+      - name: Run
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -eux
           python hdd_system.py
@@ -60,7 +63,7 @@ jobs:
 
           git commit -m "Daily HDD update"
 
-          # ✅ 推之前再抓一次，避免剛好有人推新 commit
-          git pull --rebase --autostash origin main
+          # ✅ push 前再保險：如果遠端剛好多了一個 commit，就把自己的 commit rebase 上去
+          git pull --rebase origin main
 
-          git push origin HEAD:main
+          git push origin main
