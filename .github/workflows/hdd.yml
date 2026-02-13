@@ -3,7 +3,7 @@ name: HDD Daily Run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * *"   # 每天 UTC 00:00（泰國 GMT+7 = 07:00）
 
 concurrency:
   group: hdd-daily
@@ -15,19 +15,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout (full history)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # ✅ 先把本地工作目錄強制對齊遠端 main，避免 push 時 fetch-first
-      - name: Sync with origin/main
-        run: |
-          set -eux
-          git fetch origin main
-          git checkout main
-          git reset --hard origin/main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,6 +32,13 @@ jobs:
           set -eux
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # ✅ 先同步遠端，避免 fetch first
+      - name: Sync with origin/main
+        run: |
+          set -eux
+          git fetch origin main
+          git rebase origin/main || (git rebase --abort && git reset --hard origin/main)
 
       - name: Run
         run: |
@@ -59,7 +59,17 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Daily HDD update"
+          git commit -m "Daily HDD update" || true
 
-          # ✅ push（如果剛好又被更新，重試一次）
-          git push origin main || (git fetch origin main && git reset --hard origin/main && exit 1)
+          # ✅ 推不上去就再同步一次再推（處理同時多次 run）
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push rejected, retry sync... ($i)"
+            git fetch origin main
+            git rebase origin/main || (git rebase --abort && git reset --hard origin/main)
+          done
+
+          echo "Push failed after retries"
+          exit 1
