@@ -1,12 +1,13 @@
-name: HDD Daily Run
+name: HDD/CDD + Storage Monitor
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 0,12 * * *"  # 00Z / 12Z
+    - cron: "20 0 * * *"
+    - cron: "20 12 * * *"
 
 concurrency:
-  group: hdd-daily
+  group: hdd-cdd-storage
   cancel-in-progress: false
 
 permissions:
@@ -36,12 +37,6 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # 可選：你要改地點/參數就在 Secrets 或這裡 env 設定
-          LAT: "40.7128"
-          LON: "-74.0060"
-          BASE_F: "65"
-          FORECAST_DAYS: "16"
-          PAST_DAYS: "20"
         run: |
           set -eux
           python hdd_system.py
@@ -52,14 +47,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_chart.png
-
+          git add ng_hdd_data.csv hdd_cdd_chart.png
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Daily HDD/CDD update"
+          git commit -m "Daily HDD/CDD/Storage update"
 
-          git pull --rebase origin main
+          # 拉遠端最新再推（避免 fetch first）
+          git fetch origin main
+          git rebase origin/main
           git push origin HEAD:main
