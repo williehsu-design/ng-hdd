@@ -53,7 +53,7 @@ def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requ
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
             if r.status_code >= 400:
-                raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:300]}", response=r)
+                raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
             return r
         except Exception as e:
             last_err = e
@@ -74,6 +74,10 @@ def fmt_arrow(delta: float) -> str:
 def run_tag_from_utc(now: dt.datetime) -> str:
     # schedule is 00:20 & 12:20 UTC → label them AM/PM
     return "AM" if now.hour < 12 else "PM"
+
+def _redact_api_key(text: str) -> str:
+    # avoid leaking api_key in logs/telegram
+    return re.sub(r"(api_key=)[^&\s]+", r"\1***", text)
 
 # =========================
 # WEATHER / HDD / CDD
@@ -143,7 +147,7 @@ def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: in
             temps[i] = next_valid
 
     if any(v is None for v in temps):
-        raise RuntimeError(f"Open-Meteo temps still contain nulls: {temps}")
+        raise RuntimeError("Open-Meteo temps still contain nulls after fill")
 
     return dates, [float(x) for x in temps]
 
@@ -187,73 +191,82 @@ class StorageInfo:
 def _parse_eia_storage_report_fallback() -> StorageInfo:
     """
     Fallback scrape (no key): parse eia.gov/naturalgas/storage text.
+    (This page text can change; keep as last resort.)
     """
     url = "https://www.eia.gov/naturalgas/storage/"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    html = r.text
-
-    m = re.search(
-        r"Working gas in storage was\s+([\d,]+)\s+Bcf\s+as of Friday,\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
-        html
-    )
-    if not m:
-        return StorageInfo(note="fallback parse failed (pattern not found)")
-
-    bcf = float(m.group(1).replace(",", ""))
-    month_name = m.group(2)
-    day = int(m.group(3))
-    year = int(m.group(4))
-
-    week = None
     try:
-        d = dt.datetime.strptime(f"{month_name} {day} {year}", "%B %d %Y").date()
-        week = d.isoformat()
-    except Exception:
-        pass
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        html = r.text
 
-    return StorageInfo(week=week, total_bcf=bcf, bias="NA", note="fallback: eia.gov/storage")
+        # Try a couple patterns (site wording changes sometimes)
+        patterns = [
+            r"Working gas in storage was\s+([\d,]+)\s+Bcf\s+as of Friday,\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+            r"Working gas in storage was\s+([\d,]+)\s+Bcf.*?as of Friday,\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+        ]
+        m = None
+        for p in patterns:
+            m = re.search(p, html, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                break
+        if not m:
+            return StorageInfo(note="fallback parse failed (pattern not found)")
+
+        bcf = float(m.group(1).replace(",", ""))
+        month_name = m.group(2)
+        day = int(m.group(3))
+        year = int(m.group(4))
+
+        week = None
+        try:
+            d = dt.datetime.strptime(f"{month_name} {day} {year}", "%B %d %Y").date()
+            week = d.isoformat()
+        except Exception:
+            pass
+
+        return StorageInfo(week=week, total_bcf=bcf, bias="NA", note="fallback: eia.gov/naturalgas/storage")
+    except Exception as e:
+        return StorageInfo(note=f"fallback failed: {_redact_api_key(str(e))}")
 
 def fetch_storage_eia(api_key: str) -> StorageInfo:
     """
-    Primary: EIA series endpoint for Lower 48 total working gas (Bcf).
-      series_id = NG.NW2_EPG0_SWO_R48_BCF.W
+    ✅ Use EIA APIv2 backward-compat route:
+      https://api.eia.gov/v2/seriesid/<APIv1-series-id>?api_key=...
+    We pass APIv1 series id for Lower 48 total working gas:
+      NG.NW2_EPG0_SWO_R48_BCF.W
     """
     if not api_key:
         return StorageInfo(note="EIA_API_KEY not set (storage skipped)")
 
-    url = "https://api.eia.gov/series/"
-    params = {
-        "api_key": api_key,
-        "series_id": "NG.NW2_EPG0_SWO_R48_BCF.W",
-        "out": "json",
-    }
+    seriesid = "NG.NW2_EPG0_SWO_R48_BCF.W"
+    url = f"https://api.eia.gov/v2/seriesid/{seriesid}"
+    params = {"api_key": api_key}
 
     try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
+        r = retry_get(url, params=params, tries=3, timeout=20)
         j = r.json()
 
-        series = (j.get("series") or [])
-        if not series or not series[0].get("data"):
-            raise RuntimeError("EIA series empty")
+        # APIv2 returns: response.data as list of dicts, often including "period" + "value"
+        data = j.get("response", {}).get("data", [])
+        if not data:
+            raise RuntimeError("v2 seriesid: empty data")
 
-        data = series[0]["data"]  # newest first: [[YYYYMMDD, value], ...]
-        latest = data[0]
-        prev = data[1] if len(data) > 1 else None
+        # Sort by period descending just in case
+        # period for weekly often like "2026-02-06" (or similar)
+        data_sorted = sorted(data, key=lambda x: str(x.get("period", "")), reverse=True)
 
-        date_raw = str(latest[0])  # YYYYMMDD
-        val = float(latest[1])
+        latest = data_sorted[0]
+        prev = data_sorted[1] if len(data_sorted) > 1 else None
 
-        week = None
-        if len(date_raw) == 8 and date_raw.isdigit():
-            week = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+        week = str(latest.get("period", "")) or None
+        val = latest.get("value", None)
+        total = float(val) if val is not None else None
 
         wow = None
         bias = "NA"
-        if prev is not None:
-            prev_val = float(prev[1])
-            wow = val - prev_val
+        if prev is not None and total is not None and prev.get("value", None) is not None:
+            prev_total = float(prev["value"])
+            wow = total - prev_total
             if abs(wow) < 0.5:
                 bias = "FLAT"
             elif wow < 0:
@@ -263,14 +276,16 @@ def fetch_storage_eia(api_key: str) -> StorageInfo:
 
         return StorageInfo(
             week=week,
-            total_bcf=val,
+            total_bcf=total,
             wow_bcf=wow,
             bias=bias,
-            note="ok: NG.NW2_EPG0_SWO_R48_BCF.W"
+            note="ok: v2/seriesid"
         )
+
     except Exception as e:
+        msg = _redact_api_key(str(e))
         fb = _parse_eia_storage_report_fallback()
-        fb.note = f"primary failed ({e}); {fb.note}"
+        fb.note = f"primary failed ({msg}); {fb.note}"
         return fb
 
 # =========================
@@ -454,7 +469,7 @@ def run():
     d_cdd15 = _norm_delta(m["cdd_15d"] - prev_cdd15)
     d_cdd30 = _norm_delta(m["cdd_30d"] - prev_cdd30)
 
-    # 4) Storage (Lower 48 total)
+    # 4) Storage (Lower 48 total) - APIv2 /seriesid route
     storage = fetch_storage_eia(EIA_API_KEY)
 
     # 5) Price (FRED)
