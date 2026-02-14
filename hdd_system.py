@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
@@ -18,16 +19,16 @@ LON = -74.0060
 BASE_F = 65.0
 
 CSV_PATH = "ng_hdd_data.csv"
-CHART_PATH = "hdd_cdd_chart.png"  # align with workflow git add
+CHART_PATH = "hdd_cdd_chart.png"
 
 PAST_DAYS = 14
 FORECAST_DAYS = 16  # 14 + 16 + today ≈ 31 points
 
-# Price sources
-PRICE_SYMBOL_PRIMARY = "NG=F"      # Yahoo (often blocked on Actions)
-PRICE_SYMBOL_FALLBACK = "UNG"      # Yahoo fallback
-PRICE_FRED_SERIES = "DHHNGSP"      # ✅ FRED Henry Hub spot (no key)
-PRICE_STOOQ_FALLBACK = "ng.f"      # last-resort
+# Price: use FRED (stable, no key)
+PRICE_FRED_SERIES = "DHHNGSP"  # Henry Hub spot
+
+# Delta display / signal threshold (avoid +0.00 / -0.00 noise)
+EPS = 0.01  # treat |delta| < 0.01 as 0
 
 # =========================
 # ENV (GitHub Secrets)
@@ -61,12 +62,18 @@ def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requ
             time.sleep(sleep_s)
     raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}")
 
+def _norm_delta(x: float) -> float:
+    return 0.0 if abs(x) < EPS else float(x)
+
 def fmt_arrow(delta: float) -> str:
-    if delta > 0.001:
-        return "⬆️"
-    if delta < -0.001:
-        return "⬇️"
-    return "➖"
+    delta = _norm_delta(delta)
+    if delta == 0.0:
+        return "➖"
+    return "⬆️" if delta > 0 else "⬇️"
+
+def run_tag_from_utc(now: dt.datetime) -> str:
+    # schedule is 00:20 & 12:20 UTC → label them AM/PM
+    return "AM" if now.hour < 12 else "PM"
 
 # =========================
 # WEATHER / HDD / CDD
@@ -151,7 +158,7 @@ def weighted_avg_recent(values: np.ndarray) -> float:
     n = len(values)
     if n == 0:
         return float("nan")
-    w = np.linspace(0.5, 1.0, n)
+    w = np.linspace(0.5, 1.0, n)  # increasing weights
     return float(np.sum(values * w) / np.sum(w))
 
 def compute_15_30(df: pd.DataFrame) -> Dict[str, float]:
@@ -167,50 +174,107 @@ def compute_15_30(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 # =========================
-# STORAGE (EIA v2)
+# STORAGE (Lower 48 Total Working Gas)
 # =========================
 @dataclass
 class StorageInfo:
-    week: Optional[str] = None
+    week: Optional[str] = None         # YYYY-MM-DD
     total_bcf: Optional[float] = None
-    bias: str = "NA"
+    wow_bcf: Optional[float] = None
+    bias: str = "NA"                   # DRAW / BUILD / FLAT / NA
     note: str = ""
 
+def _parse_eia_storage_report_fallback() -> StorageInfo:
+    """
+    Fallback scrape (no key): parse eia.gov/naturalgas/storage text.
+    """
+    url = "https://www.eia.gov/naturalgas/storage/"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    html = r.text
+
+    m = re.search(
+        r"Working gas in storage was\s+([\d,]+)\s+Bcf\s+as of Friday,\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+        html
+    )
+    if not m:
+        return StorageInfo(note="fallback parse failed (pattern not found)")
+
+    bcf = float(m.group(1).replace(",", ""))
+    month_name = m.group(2)
+    day = int(m.group(3))
+    year = int(m.group(4))
+
+    week = None
+    try:
+        d = dt.datetime.strptime(f"{month_name} {day} {year}", "%B %d %Y").date()
+        week = d.isoformat()
+    except Exception:
+        pass
+
+    return StorageInfo(week=week, total_bcf=bcf, bias="NA", note="fallback: eia.gov/storage")
+
 def fetch_storage_eia(api_key: str) -> StorageInfo:
+    """
+    Primary: EIA series endpoint for Lower 48 total working gas (Bcf).
+      series_id = NG.NW2_EPG0_SWO_R48_BCF.W
+    """
     if not api_key:
         return StorageInfo(note="EIA_API_KEY not set (storage skipped)")
 
-    url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+    url = "https://api.eia.gov/series/"
     params = {
         "api_key": api_key,
-        "frequency": "weekly",
-        "data[0]": "value",
-        "sort[0][column]": "period",
-        "sort[0][direction]": "desc",
-        "offset": 0,
-        "length": 1,
+        "series_id": "NG.NW2_EPG0_SWO_R48_BCF.W",
+        "out": "json",
     }
 
     try:
-        r = retry_get(url, params=params, tries=3, timeout=20)
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
         j = r.json()
-        rows = j.get("response", {}).get("data", [])
-        if not rows:
-            return StorageInfo(note="EIA response empty")
-        row = rows[0]
-        week = str(row.get("period", "")) or None
-        total = row.get("value", None)
+
+        series = (j.get("series") or [])
+        if not series or not series[0].get("data"):
+            raise RuntimeError("EIA series empty")
+
+        data = series[0]["data"]  # newest first: [[YYYYMMDD, value], ...]
+        latest = data[0]
+        prev = data[1] if len(data) > 1 else None
+
+        date_raw = str(latest[0])  # YYYYMMDD
+        val = float(latest[1])
+
+        week = None
+        if len(date_raw) == 8 and date_raw.isdigit():
+            week = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+
+        wow = None
+        bias = "NA"
+        if prev is not None:
+            prev_val = float(prev[1])
+            wow = val - prev_val
+            if abs(wow) < 0.5:
+                bias = "FLAT"
+            elif wow < 0:
+                bias = "DRAW"
+            else:
+                bias = "BUILD"
+
         return StorageInfo(
             week=week,
-            total_bcf=float(total) if total is not None else None,
-            bias="NA",
-            note="EIA ok",
+            total_bcf=val,
+            wow_bcf=wow,
+            bias=bias,
+            note="ok: NG.NW2_EPG0_SWO_R48_BCF.W"
         )
     except Exception as e:
-        return StorageInfo(note=f"Storage fetch failed: {e}")
+        fb = _parse_eia_storage_report_fallback()
+        fb.note = f"primary failed ({e}); {fb.note}"
+        return fb
 
 # =========================
-# PRICE
+# PRICE (FRED)
 # =========================
 @dataclass
 class PriceInfo:
@@ -221,11 +285,10 @@ class PriceInfo:
     break3_low: Optional[bool] = None
     note: str = ""
 
-def _calc_price_signals(close: pd.Series, symbol: str, note: str) -> PriceInfo:
-    close = close.dropna()
+def _calc_price_signals(close: pd.Series, symbol: str, source_note: str) -> PriceInfo:
+    close = pd.to_numeric(close, errors="coerce").dropna()
     if len(close) < 6:
-        return PriceInfo(symbol=symbol, note=f"{note}: not enough bars")
-
+        return PriceInfo(symbol=symbol, note=f"{source_note}: not enough bars")
     last = float(close.iloc[-1])
     ma5 = float(close.tail(5).mean())
     prior3 = close.iloc[-4:-1]
@@ -233,23 +296,9 @@ def _calc_price_signals(close: pd.Series, symbol: str, note: str) -> PriceInfo:
     break3_low = bool(last < float(prior3.min()))
     return PriceInfo(symbol=symbol, price=last, ma5=ma5, break3_high=break3_high, break3_low=break3_low, note="ok")
 
-def fetch_price_yfinance(symbol: str) -> PriceInfo:
-    try:
-        import yfinance as yf
-    except Exception as e:
-        return PriceInfo(symbol=symbol, note=f"yfinance not available: {e}")
-
-    try:
-        df = yf.download(symbol, period="1mo", interval="1d", progress=False, threads=False)
-        if df is None or df.empty or "Close" not in df.columns:
-            return PriceInfo(symbol=symbol, note=f"{symbol}: empty")
-        return _calc_price_signals(df["Close"], symbol, "yfinance")
-    except Exception as e:
-        return PriceInfo(symbol=symbol, note=f"{symbol}: failed: {e}")
-
-def fetch_price_fred(series_id: str = "DHHNGSP") -> PriceInfo:
+def fetch_price_fred(series_id: str) -> PriceInfo:
     """
-    ✅ FRED CSV (no api key):
+    FRED CSV (no key):
     https://fred.stlouisfed.org/graph/fredgraph.csv?id=DHHNGSP
     """
     try:
@@ -262,51 +311,11 @@ def fetch_price_fred(series_id: str = "DHHNGSP") -> PriceInfo:
         if df is None or df.empty or df.shape[1] < 2:
             return PriceInfo(symbol=f"FRED:{series_id}", note="fred: empty")
 
-        # columns: DATE, DHHNGSP
         col = df.columns[1]
-        close = pd.to_numeric(df[col], errors="coerce")
+        close = df[col]
         return _calc_price_signals(close, f"FRED:{series_id}", "fred")
     except Exception as e:
         return PriceInfo(symbol=f"FRED:{series_id}", note=f"fred failed: {e}")
-
-def fetch_price_stooq(symbol_stooq: str) -> PriceInfo:
-    try:
-        url = "https://stooq.com/q/d/l/"
-        params = {"s": symbol_stooq, "i": "d"}
-        r = retry_get(url, params=params, tries=3, timeout=20)
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        if df is None or df.empty or "Close" not in df.columns:
-            return PriceInfo(symbol=symbol_stooq, note="stooq: empty/not-csv")
-        return _calc_price_signals(df["Close"], symbol_stooq, "stooq")
-    except Exception as e:
-        return PriceInfo(symbol=symbol_stooq, note=f"stooq failed: {e}")
-
-def fetch_price_with_fallback() -> PriceInfo:
-    # 1) Yahoo primary
-    p = fetch_price_yfinance(PRICE_SYMBOL_PRIMARY)
-    if p.note == "ok":
-        return p
-
-    # 2) Yahoo fallback
-    p2 = fetch_price_yfinance(PRICE_SYMBOL_FALLBACK)
-    if p2.note == "ok":
-        return p2
-
-    # 3) ✅ FRED (very stable)
-    pf = fetch_price_fred(PRICE_FRED_SERIES)
-    if pf.note == "ok":
-        return pf
-
-    # 4) last-resort Stooq
-    ps = fetch_price_stooq(PRICE_STOOQ_FALLBACK)
-    if ps.note == "ok":
-        return ps
-
-    return PriceInfo(
-        symbol=PRICE_SYMBOL_PRIMARY,
-        note=f"primary failed ({p.note}); fallback failed ({p2.note}); fred failed ({pf.note}); stooq failed ({ps.note})"
-    )
 
 # =========================
 # SIGNAL LOGIC
@@ -317,6 +326,9 @@ def decide_trade_2_5d_boilkold(
     storage: StorageInfo,
     price: PriceInfo,
 ) -> Tuple[str, str]:
+    d_hdd15 = _norm_delta(d_hdd15)
+    d_hdd30 = _norm_delta(d_hdd30)
+
     if d_hdd15 > 0 and d_hdd30 > 0:
         weather_dir = +1
         accel = (d_hdd15 > d_hdd30)
@@ -333,21 +345,21 @@ def decide_trade_2_5d_boilkold(
     price_ok_short = (price.price < price.ma5) and bool(price.break3_low)
 
     stor_dir = 0
-    if "bull" in (storage.bias or "").lower():
+    if storage.bias == "DRAW":
         stor_dir = +1
-    elif "bear" in (storage.bias or "").lower():
+    elif storage.bias == "BUILD":
         stor_dir = -1
 
     if weather_dir == +1:
         if not price_ok_long:
             return ("WAIT", "No price confirmation for long")
-        conf = 7.0 + (1.0 if accel else 0.0) + (1.0 if stor_dir == +1 else 0.0) - (1.0 if stor_dir == -1 else 0.0)
+        conf = 7.0 + (1.0 if accel else 0.0) + (0.5 if stor_dir == +1 else 0.0) - (0.5 if stor_dir == -1 else 0.0)
         conf = max(1.0, min(10.0, conf))
         return ("BOIL LONG (2–5D)", f"{conf:.1f}/10")
     else:
         if not price_ok_short:
             return ("WAIT", "No price confirmation for short")
-        conf = 7.0 + (1.0 if accel else 0.0) + (1.0 if stor_dir == -1 else 0.0) - (1.0 if stor_dir == +1 else 0.0)
+        conf = 7.0 + (1.0 if accel else 0.0) + (0.5 if stor_dir == -1 else 0.0) - (0.5 if stor_dir == +1 else 0.0)
         conf = max(1.0, min(10.0, conf))
         return ("KOLD LONG (2–5D)", f"{conf:.1f}/10")
 
@@ -368,7 +380,7 @@ def append_row(path: str, row: dict) -> pd.DataFrame:
     out.to_csv(path, index=False)
     return out
 
-def make_chart(weather_df: pd.DataFrame, run_date_utc: str, out_path: str) -> None:
+def make_chart(weather_df: pd.DataFrame, run_label: str, out_path: str) -> None:
     last30 = weather_df.tail(30).copy()
     if last30.empty:
         return
@@ -376,7 +388,7 @@ def make_chart(weather_df: pd.DataFrame, run_date_utc: str, out_path: str) -> No
     ax = plt.gca()
     ax.plot(last30["date"], last30["hdd"], label=f"Daily HDD (base {BASE_F:.0f}F)")
     ax.plot(last30["date"], last30["cdd"], label=f"Daily CDD (base {BASE_F:.0f}F)")
-    ax.set_title(f"HDD/CDD Trend · {run_date_utc}")
+    ax.set_title(f"HDD/CDD Trend · {run_label}")
     ax.set_xlabel("Day (UTC)")
     ax.set_ylabel("Degree Days")
     ax.legend()
@@ -417,11 +429,17 @@ def run():
     now = utc_now()
     run_date = now.strftime("%Y-%m-%d")
     run_ts = fmt_utc(now)
+    tag = run_tag_from_utc(now)  # AM / PM
+    run_label = f"{run_date} {tag} UTC"
 
+    # 1) Weather
     dates, temps = fetch_daily_mean_f(LAT, LON, PAST_DAYS, FORECAST_DAYS)
     wdf = compute_hdd_cdd_series(dates, temps, BASE_F)
+
+    # 2) Metrics
     m = compute_15_30(wdf)
 
+    # 3) Delta vs previous row (compare to last record, regardless AM/PM)
     hist = load_csv(CSV_PATH)
     if not hist.empty and all(k in hist.columns for k in ["hdd_15d", "hdd_30d", "cdd_15d", "cdd_30d"]):
         prev_hdd15 = float(hist.iloc[-1]["hdd_15d"])
@@ -431,18 +449,24 @@ def run():
     else:
         prev_hdd15, prev_hdd30, prev_cdd15, prev_cdd30 = m["hdd_15d"], m["hdd_30d"], m["cdd_15d"], m["cdd_30d"]
 
-    d_hdd15 = m["hdd_15d"] - prev_hdd15
-    d_hdd30 = m["hdd_30d"] - prev_hdd30
-    d_cdd15 = m["cdd_15d"] - prev_cdd15
-    d_cdd30 = m["cdd_30d"] - prev_cdd30
+    d_hdd15 = _norm_delta(m["hdd_15d"] - prev_hdd15)
+    d_hdd30 = _norm_delta(m["hdd_30d"] - prev_hdd30)
+    d_cdd15 = _norm_delta(m["cdd_15d"] - prev_cdd15)
+    d_cdd30 = _norm_delta(m["cdd_30d"] - prev_cdd30)
 
+    # 4) Storage (Lower 48 total)
     storage = fetch_storage_eia(EIA_API_KEY)
-    price = fetch_price_with_fallback()
 
+    # 5) Price (FRED)
+    price = fetch_price_fred(PRICE_FRED_SERIES)
+
+    # 6) Signal
     signal, conf = decide_trade_2_5d_boilkold(d_hdd15, d_hdd30, storage, price)
 
+    # 7) Save CSV
     row = {
         "run_utc": run_ts,
+        "run_tag": tag,  # AM/PM
         "date_utc": run_date,
         "hdd_15d": round(m["hdd_15d"], 2),
         "hdd_30d": round(m["hdd_30d"], 2),
@@ -454,6 +478,7 @@ def run():
         "delta_cdd30": round(d_cdd30, 2),
         "storage_week": storage.week or "",
         "storage_total_bcf": storage.total_bcf if storage.total_bcf is not None else "",
+        "storage_wow_bcf": storage.wow_bcf if storage.wow_bcf is not None else "",
         "storage_bias": storage.bias,
         "price_symbol": price.symbol,
         "price": price.price if price.price is not None else "",
@@ -466,10 +491,13 @@ def run():
     }
     append_row(CSV_PATH, row)
 
-    make_chart(wdf, f"{run_date} UTC", CHART_PATH)
+    # 8) Chart (same filename, overwritten each run)
+    make_chart(wdf, run_label, CHART_PATH)
 
+    # 9) Telegram message
     lines = []
     lines.append(f"📌 <b>HDD/CDD Update ({run_date})</b>")
+    lines.append(f"• Run: <b>{tag}</b> (UTC)")
     lines.append("")
     lines.append(f"🔥 <b>HDD</b> (base {BASE_F:.0f}F)")
     lines.append(f"• 15D Wtd: <b>{m['hdd_15d']:.2f}</b>  ({fmt_arrow(d_hdd15)} Δ {d_hdd15:+.2f})")
@@ -481,9 +509,12 @@ def run():
     lines.append("")
 
     if storage.week and storage.total_bcf is not None:
-        lines.append("🧱 <b>Storage</b> (EIA)")
+        lines.append("🧱 <b>Storage</b> (EIA · Lower 48 Total)")
         lines.append(f"• Week: {storage.week}")
         lines.append(f"• Total: {storage.total_bcf:.0f} bcf")
+        if storage.wow_bcf is not None:
+            sign = "+" if storage.wow_bcf >= 0 else ""
+            lines.append(f"• WoW: {sign}{storage.wow_bcf:.0f} bcf")
         lines.append(f"• Bias: <b>{storage.bias}</b>")
         lines.append("")
     else:
@@ -511,15 +542,14 @@ def run():
 
     msg = "\n".join(lines)
     tg_send_message(TG_BOT_TOKEN, TG_CHAT_ID, msg)
-    tg_send_photo(TG_BOT_TOKEN, TG_CHAT_ID, CHART_PATH, caption=f"📈 Trend (HDD/CDD) · {run_date} UTC")
+    tg_send_photo(TG_BOT_TOKEN, TG_CHAT_ID, CHART_PATH, caption=f"📈 Trend (HDD/CDD) · {run_label}")
 
-    # Actions log debug
     print("[INFO] ENV present:",
           f"TG_BOT_TOKEN={'yes' if TG_BOT_TOKEN else 'no'}",
           f"TG_CHAT_ID={'yes' if TG_CHAT_ID else 'no'}",
           f"EIA_API_KEY={'yes' if EIA_API_KEY else 'no'}")
-    print(f"[INFO] Price source: {price.symbol} ({price.note})")
     print(f"[INFO] Storage note: {storage.note}")
+    print(f"[INFO] Price source: {price.symbol} ({price.note})")
     print("[OK] Done.")
 
 if __name__ == "__main__":
