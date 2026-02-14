@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: hdd-cdd-storage
-  cancel-in-progress: false
+  cancel-in-progress: false 
 
 permissions:
   contents: write
