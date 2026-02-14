@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: hdd-cdd-storage
-  cancel-in-progress: false  
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -16,8 +16,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    # ✅ 用 job-level env，最不容易被縮排/step 影響
     env:
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -29,6 +27,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Sync with origin/main (before running)
+        run: |
+          set -eux
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -39,25 +44,6 @@ jobs:
           set -eux
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Debug env presence
-        run: |
-          python - <<'PY'
-          import os
-          print("TG_BOT_TOKEN set:", bool(os.getenv("TG_BOT_TOKEN")))
-          print("TG_CHAT_ID set:", bool(os.getenv("TG_CHAT_ID")))
-          print("EIA_API_KEY set:", bool(os.getenv("EIA_API_KEY")))
-          PY
-
-      # ✅ 不印出 key，只印出有沒有拿到
-      - name: Debug env presence
-        run: |
-          python - <<'PY'
-          import os
-          print("TG_BOT_TOKEN set:", bool(os.getenv("TG_BOT_TOKEN")))
-          print("TG_CHAT_ID set:", bool(os.getenv("TG_CHAT_ID")))
-          print("EIA_API_KEY set:", bool(os.getenv("EIA_API_KEY")))
-          PY
 
       - name: Run script (also sends Telegram)
         run: |
@@ -77,7 +63,4 @@ jobs:
           fi
 
           git commit -m "Daily HDD/CDD/Storage update"
-
-          git fetch origin main
-          git rebase origin/main
           git push origin HEAD:main
