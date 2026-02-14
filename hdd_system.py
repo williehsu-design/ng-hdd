@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
@@ -16,27 +15,29 @@ import matplotlib.pyplot as plt
 # =========================
 LAT = 40.7128
 LON = -74.0060
-
 BASE_F = 65.0
 
 CSV_PATH = "ng_hdd_data.csv"
-CHART_PATH = "hdd_chart.png"
+CHART_PATH = "hdd_cdd_chart.png"  # ✅ align with workflow git add
 
-# Open-Meteo (free) commonly limits forecast_days <= 16.
-# We need >=30 days to compute 30D metrics, so combine past + forecast.
+# Open-Meteo (free) limits forecast_days <= 16. Combine past + forecast to get ~31 days.
 PAST_DAYS = 14
 FORECAST_DAYS = 16  # 14 + 16 + today ≈ 31 points
 
 # Price confirmation (primary) + fallback
 PRICE_SYMBOL_PRIMARY = "NG=F"  # Henry Hub Natural Gas Futures (Yahoo)
 PRICE_SYMBOL_FALLBACK = "UNG"  # ETF fallback if NG=F is flaky
+PRICE_STOOQ_FALLBACK = "ng.f"  # ✅ Stooq fallback (daily futures series)
 
-# Telegram (GitHub Secrets)
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+# =========================
+# ENV (GitHub Secrets)
+# Support both old and new env names to avoid mismatch issues.
+# Secrets you showed: TG_BOT_TOKEN, TG_CHAT_ID, EIA_API_KEY
+# =========================
+TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
+TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+EIA_API_KEY = (os.getenv("EIA_API_KEY") or "").strip()
 
-# Optional EIA API Key for storage (GitHub Secret: EIA_API_KEY)
-EIA_API_KEY = os.getenv("EIA_API_KEY", "").strip()
 
 # =========================
 # HELPERS
@@ -44,14 +45,20 @@ EIA_API_KEY = os.getenv("EIA_API_KEY", "").strip()
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
+
 def fmt_utc(ts: dt.datetime) -> str:
     return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+
 def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requests.Response:
     last_err = None
+    headers = {
+        # light UA helps some endpoints; harmless elsewhere
+        "User-Agent": "Mozilla/5.0 (GitHubActions; HDDCDDMonitor/1.0)"
+    }
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, timeout=timeout, headers=headers)
             if r.status_code >= 400:
                 raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:300]}", response=r)
             return r
@@ -62,12 +69,14 @@ def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requ
             time.sleep(sleep_s)
     raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}")
 
+
 def fmt_arrow(delta: float) -> str:
     if delta > 0.001:
         return "⬆️"
     if delta < -0.001:
         return "⬇️"
     return "➖"
+
 
 # =========================
 # WEATHER / HDD / CDD
@@ -95,12 +104,14 @@ def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: in
         raise RuntimeError(f"Open-Meteo returned invalid payload: {json.dumps(daily)[:400]}")
     return dates, [float(x) for x in temps]
 
+
 def compute_hdd_cdd_series(dates: List[str], temps_f: List[float], base_f: float) -> pd.DataFrame:
     df = pd.DataFrame({"date": pd.to_datetime(dates), "tmean_f": temps_f})
     df = df.sort_values("date").reset_index(drop=True)
     df["hdd"] = np.maximum(0.0, base_f - df["tmean_f"])
     df["cdd"] = np.maximum(0.0, df["tmean_f"] - base_f)
     return df
+
 
 def weighted_avg_recent(values: np.ndarray) -> float:
     """
@@ -110,23 +121,22 @@ def weighted_avg_recent(values: np.ndarray) -> float:
     n = len(values)
     if n == 0:
         return float("nan")
-    # increasing weights from old->new
-    w = np.linspace(0.5, 1.0, n)
+    w = np.linspace(0.5, 1.0, n)  # increasing weights
     return float(np.sum(values * w) / np.sum(w))
+
 
 def compute_15_30(df: pd.DataFrame) -> Dict[str, float]:
     last15 = df.tail(15).sort_values("date")
     last30 = df.tail(30).sort_values("date")
-
     if len(last30) < 30:
         raise RuntimeError(f"Not enough days to compute 30D metrics (need 30, got {len(last30)})")
-
     return {
         "hdd_15d": weighted_avg_recent(last15["hdd"].to_numpy()),
         "hdd_30d": weighted_avg_recent(last30["hdd"].to_numpy()),
         "cdd_15d": weighted_avg_recent(last15["cdd"].to_numpy()),
         "cdd_30d": weighted_avg_recent(last30["cdd"].to_numpy()),
     }
+
 
 # =========================
 # STORAGE (OPTIONAL)
@@ -138,9 +148,10 @@ class StorageInfo:
     bias: str = "NA"
     note: str = ""
 
+
 def fetch_storage_eia(api_key: str) -> StorageInfo:
     """
-    Optional: Pull latest weekly storage using EIA v2 API.
+    Pull latest weekly storage using EIA v2 API.
     If no api_key, returns NA but doesn't crash.
     """
     if not api_key:
@@ -166,15 +177,21 @@ def fetch_storage_eia(api_key: str) -> StorageInfo:
         row = rows[0]
         week = str(row.get("period", "")) or None
         total = row.get("value", None)
-        info = StorageInfo(week=week, total_bcf=float(total) if total is not None else None)
-        info.bias = "NA"
-        info.note = "EIA ok (partial fields)"
+
+        info = StorageInfo(
+            week=week,
+            total_bcf=float(total) if total is not None else None,
+            bias="NA",
+            note="EIA ok"
+        )
         return info
     except Exception as e:
         return StorageInfo(note=f"Storage fetch failed: {e}")
 
+
 # =========================
-# PRICE CONFIRMATION (NG=F -> UNG fallback)
+# PRICE CONFIRMATION
+# Yahoo via yfinance -> fallback Stooq
 # =========================
 @dataclass
 class PriceInfo:
@@ -185,17 +202,15 @@ class PriceInfo:
     break3_low: Optional[bool] = None
     note: str = ""
 
-def fetch_price_single(symbol: str) -> PriceInfo:
-    """
-    Fetch price from Yahoo via yfinance.
-    """
+
+def fetch_price_yfinance(symbol: str) -> PriceInfo:
     try:
         import yfinance as yf
     except Exception as e:
         return PriceInfo(symbol=symbol, note=f"yfinance not available: {e}")
 
     try:
-        df = yf.download(symbol, period="1mo", interval="1d", progress=False)
+        df = yf.download(symbol, period="1mo", interval="1d", progress=False, threads=False)
         if df is None or df.empty:
             return PriceInfo(symbol=symbol, note=f"{symbol}: empty")
 
@@ -205,29 +220,57 @@ def fetch_price_single(symbol: str) -> PriceInfo:
 
         last = float(close.iloc[-1])
         ma5 = float(close.tail(5).mean())
-
         prior3 = close.iloc[-4:-1]  # previous 3 closes
         break3_high = bool(last > float(prior3.max()))
         break3_low = bool(last < float(prior3.min()))
-
         return PriceInfo(symbol=symbol, price=last, ma5=ma5, break3_high=break3_high, break3_low=break3_low, note="ok")
     except Exception as e:
         return PriceInfo(symbol=symbol, note=f"{symbol}: failed: {e}")
 
-def fetch_price_with_fallback(primary: str, fallback: str) -> PriceInfo:
+
+def fetch_price_stooq(symbol_stooq: str) -> PriceInfo:
     """
-    Try primary symbol first, fallback if needed.
+    Stooq daily CSV: https://stooq.com/q/d/l/?s=ng.f&i=d
     """
-    p = fetch_price_single(primary)
-    if p.price is not None and p.ma5 is not None and p.note == "ok":
+    try:
+        url = "https://stooq.com/q/d/l/"
+        params = {"s": symbol_stooq, "i": "d"}
+        r = retry_get(url, params=params, tries=3, timeout=20)
+
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        if df is None or df.empty or "Close" not in df.columns:
+            return PriceInfo(symbol=symbol_stooq, note="stooq: empty")
+
+        close = df["Close"].dropna()
+        if len(close) < 6:
+            return PriceInfo(symbol=symbol_stooq, note="stooq: not enough bars")
+
+        last = float(close.iloc[-1])
+        ma5 = float(close.tail(5).mean())
+        prior3 = close.iloc[-4:-1]
+        break3_high = bool(last > float(prior3.max()))
+        break3_low = bool(last < float(prior3.min()))
+        return PriceInfo(symbol=symbol_stooq, price=last, ma5=ma5, break3_high=break3_high, break3_low=break3_low, note="ok")
+    except Exception as e:
+        return PriceInfo(symbol=symbol_stooq, note=f"stooq failed: {e}")
+
+
+def fetch_price_with_fallback(primary: str, fallback: str, stooq_symbol: str) -> PriceInfo:
+    p = fetch_price_yfinance(primary)
+    if p.note == "ok":
         return p
-    p2 = fetch_price_single(fallback)
-    if p2.price is not None and p2.ma5 is not None and p2.note == "ok":
+
+    p2 = fetch_price_yfinance(fallback)
+    if p2.note == "ok":
         return p2
-    # return primary attempt (for debugging)
-    if p.note != "ok" and p2.note != "ok":
-        return PriceInfo(symbol=primary, note=f"primary failed ({p.note}); fallback failed ({p2.note})")
-    return p
+
+    ps = fetch_price_stooq(stooq_symbol)
+    if ps.note == "ok":
+        return ps
+
+    return PriceInfo(symbol=primary, note=f"primary failed ({p.note}); fallback failed ({p2.note}); stooq failed ({ps.note})")
+
 
 # =========================
 # SIGNAL LOGIC (BOIL/KOLD 2–5D)
@@ -238,19 +281,13 @@ def decide_trade_2_5d_boilkold(
     storage: StorageInfo,
     price: PriceInfo,
 ) -> Tuple[str, str]:
-    """
-    3-layer gate:
-      1) Weather direction + acceleration (15 & 30 same direction)
-      2) (Optional) Storage bias (currently NA unless you add richer fields)
-      3) Price confirmation: Close vs 5MA AND break 3-day high/low
-    """
     # Weather direction
     if d_hdd15 > 0 and d_hdd30 > 0:
         weather_dir = +1
-        accel = (d_hdd15 > d_hdd30)  # short-term revision stronger than 30D => acceleration colder
+        accel = (d_hdd15 > d_hdd30)
     elif d_hdd15 < 0 and d_hdd30 < 0:
         weather_dir = -1
-        accel = (d_hdd15 < d_hdd30)  # negative and more negative than 30D => acceleration warmer
+        accel = (d_hdd15 < d_hdd30)
     else:
         return ("WAIT", "Weather mixed (15D/30D disagree)")
 
@@ -261,7 +298,7 @@ def decide_trade_2_5d_boilkold(
     price_ok_long = (price.price > price.ma5) and bool(price.break3_high)
     price_ok_short = (price.price < price.ma5) and bool(price.break3_low)
 
-    # Storage impact (optional placeholder)
+    # Storage impact placeholder (only if you later enrich bias)
     stor_dir = 0
     if "bull" in (storage.bias or "").lower():
         stor_dir = +1
@@ -274,13 +311,13 @@ def decide_trade_2_5d_boilkold(
         conf = 7.0 + (1.0 if accel else 0.0) + (1.0 if stor_dir == +1 else 0.0) - (1.0 if stor_dir == -1 else 0.0)
         conf = max(1.0, min(10.0, conf))
         return ("BOIL LONG (2–5D)", f"{conf:.1f}/10")
-
     else:
         if not price_ok_short:
             return ("WAIT", "No price confirmation for short")
         conf = 7.0 + (1.0 if accel else 0.0) + (1.0 if stor_dir == -1 else 0.0) - (1.0 if stor_dir == +1 else 0.0)
         conf = max(1.0, min(10.0, conf))
         return ("KOLD LONG (2–5D)", f"{conf:.1f}/10")
+
 
 # =========================
 # CSV / CHART / TELEGRAM
@@ -293,11 +330,13 @@ def load_csv(path: str) -> pd.DataFrame:
     except Exception:
         return pd.read_csv(path, encoding="utf-8-sig")
 
+
 def append_row(path: str, row: dict) -> pd.DataFrame:
     df = load_csv(path)
     out = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     out.to_csv(path, index=False)
     return out
+
 
 def make_chart(weather_df: pd.DataFrame, run_date_utc: str, out_path: str) -> None:
     last30 = weather_df.tail(30).copy()
@@ -317,6 +356,7 @@ def make_chart(weather_df: pd.DataFrame, run_date_utc: str, out_path: str) -> No
     plt.savefig(out_path, dpi=160)
     plt.close(fig)
 
+
 def tg_send_message(token: str, chat_id: str, text: str) -> None:
     if not token or not chat_id:
         print("[INFO] Telegram secrets missing; skip message.")
@@ -326,6 +366,7 @@ def tg_send_message(token: str, chat_id: str, text: str) -> None:
     r = requests.post(url, data=payload, timeout=20)
     if r.status_code >= 400:
         raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text[:200]}")
+
 
 def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str) -> None:
     if not token or not chat_id:
@@ -341,6 +382,7 @@ def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str) -> No
         r = requests.post(url, data=data, files=files, timeout=30)
     if r.status_code >= 400:
         raise RuntimeError(f"Telegram sendPhoto failed: {r.status_code} {r.text[:200]}")
+
 
 # =========================
 # MAIN
@@ -375,10 +417,14 @@ def run():
     # 4) Storage (optional)
     storage = fetch_storage_eia(EIA_API_KEY)
 
-    # 5) Price (NG=F -> UNG fallback)
-    price = fetch_price_with_fallback(PRICE_SYMBOL_PRIMARY, PRICE_SYMBOL_FALLBACK)
+    # 5) Price (Yahoo -> Stooq)
+    price = fetch_price_with_fallback(
+        PRICE_SYMBOL_PRIMARY,
+        PRICE_SYMBOL_FALLBACK,
+        PRICE_STOOQ_FALLBACK
+    )
 
-    # 6) Signal for BOIL/KOLD (2–5D)
+    # 6) Signal
     signal, conf = decide_trade_2_5d_boilkold(d_hdd15, d_hdd30, storage, price)
 
     # 7) Save CSV
@@ -435,7 +481,6 @@ def run():
             lines.append(f"• Note: {storage.note}")
         lines.append("")
 
-    # Price confirmation details
     if price.price is not None and price.ma5 is not None:
         above = "YES" if price.price > price.ma5 else "NO"
         b3h = "YES" if price.break3_high else "NO"
@@ -458,7 +503,15 @@ def run():
     tg_send_message(TG_BOT_TOKEN, TG_CHAT_ID, msg)
     tg_send_photo(TG_BOT_TOKEN, TG_CHAT_ID, CHART_PATH, caption=f"📈 Trend (HDD/CDD) · {run_date} UTC")
 
+    # console debug (helps Actions logs)
+    print("[INFO] ENV present:",
+          f"TG_BOT_TOKEN={'yes' if TG_BOT_TOKEN else 'no'}",
+          f"TG_CHAT_ID={'yes' if TG_CHAT_ID else 'no'}",
+          f"EIA_API_KEY={'yes' if EIA_API_KEY else 'no'}")
+    print(f"[INFO] Price source: {price.symbol} ({price.note})")
+    print(f"[INFO] Storage note: {storage.note}")
     print("[OK] Done.")
+
 
 if __name__ == "__main__":
     run()
