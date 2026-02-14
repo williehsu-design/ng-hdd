@@ -1,4 +1,4 @@
-name: HDD/CDD + Storage Monitor
+name: NG Composite Monitor
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
     - cron: "20 12 * * *"
 
 concurrency:
-  group: hdd-cdd-storage
-  cancel-in-progress: true
+  group: ng-composite
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -16,10 +16,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
 
     steps:
       - name: Checkout
@@ -27,12 +23,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ✅ 先同步遠端最新，避免 CSV/PNG 衝突
       - name: Sync with origin/main (before running)
         run: |
           set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
-          git checkout main
-          git reset --hard origin/main
+          git pull --rebase origin main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,8 +44,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run script (also sends Telegram)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          QUANDL_API_KEY: ${{ secrets.QUANDL_API_KEY }}
+          # 可選：如果你之後發現 dataset code 不對，在這裡改
+          # COT_DATASET_CODE: "CFTC/023651_F_L_ALL"
         run: |
-          set -eux
           python hdd_system.py
 
       - name: Commit & push results (csv + chart)
@@ -62,5 +66,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Daily HDD/CDD/Storage update"
+          git commit -m "NG composite update"
           git push origin HEAD:main
