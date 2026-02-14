@@ -3,7 +3,6 @@ name: HDD/CDD + Storage Monitor
 on:
   workflow_dispatch:
   schedule:
-    # 每天 00:20 UTC / 12:20 UTC（你原本的設定）
     - cron: "20 0 * * *"
     - cron: "20 12 * * *"
 
@@ -17,6 +16,13 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # ✅ 用 job-level env，最不容易被縮排/step 影響
+    env:
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,11 +40,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ✅ 不印出 key，只印出有沒有拿到
+      - name: Debug env presence
+        run: |
+          python - <<'PY'
+          import os
+          print("TG_BOT_TOKEN set:", bool(os.getenv("TG_BOT_TOKEN")))
+          print("TG_CHAT_ID set:", bool(os.getenv("TG_CHAT_ID")))
+          print("EIA_API_KEY set:", bool(os.getenv("EIA_API_KEY")))
+          PY
+
       - name: Run script (also sends Telegram)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
         run: |
           set -eux
           python hdd_system.py
@@ -49,9 +61,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # ✅ align with your final hdd_system.py output filenames
           git add ng_hdd_data.csv hdd_cdd_chart.png || true
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
@@ -59,7 +69,6 @@ jobs:
 
           git commit -m "Daily HDD/CDD/Storage update"
 
-          # ✅ safer push: rebase onto latest main to avoid fetch-first rejection
           git fetch origin main
           git rebase origin/main
           git push origin HEAD:main
