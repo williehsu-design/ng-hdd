@@ -6,6 +6,7 @@ import math
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
+from io import StringIO
 
 import requests
 import numpy as np
@@ -36,10 +37,9 @@ PRICE_FRED_SERIES = "DHHNGSP"
 EPS = 0.01  # treat |delta| < 0.01 as 0
 
 # Volatility threshold (rough; Henry Hub can be jumpy)
-VOL10_WARN = 0.06  # 6% 10D stdev of returns -> caution
+VOL10_WARN = 0.06  # 6% 10D stdev of daily returns -> caution
 
 # Composite demand basket (simple, practical weights)
-# (This is not "official" gas-weighted demand; it's a robust heuristic.)
 CITY_BASKET = [
     # name, lat, lon, weight
     ("Chicago", 41.8781, -87.6298, 0.22),
@@ -50,7 +50,10 @@ CITY_BASKET = [
     ("Denver", 39.7392, -104.9903, 0.12),
     ("Los Angeles", 34.0522, -118.2437, 0.14),
 ]
-# weights should sum ~1.0 (we'll normalize anyway)
+
+# COT thresholds (crowding)
+COT_Z_EXTREME = 1.5
+
 
 # =========================
 # ENV (GitHub Secrets)
@@ -71,7 +74,7 @@ def fmt_utc(ts: dt.datetime) -> str:
 
 def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requests.Response:
     last_err = None
-    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions; NGMonitor/2.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions; NGMonitor/3.0)"}
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -211,21 +214,18 @@ def future_window_sum(df: pd.DataFrame, today_utc_date: dt.date, days: int, col:
     dff["d"] = dff["date"].dt.date
     future = dff[dff["d"] > today_utc_date].sort_values("date")
     win = future.head(days)
-    if len(win) < days:
-        # still return what we have (avoid crash)
-        return float(win[col].sum())
     return float(win[col].sum())
 
 def build_composite_weather() -> pd.DataFrame:
     """
     Build composite daily HDD/CDD by weighted average over CITY_BASKET.
-    Returns df with columns: date, hdd, cdd, plus per-city optional (not saved).
+    Returns df with columns: date, hdd, cdd.
     """
     weights = np.array([w for (_, _, _, w) in CITY_BASKET], dtype=float)
     weights = weights / weights.sum()
 
     per_city: List[pd.DataFrame] = []
-    for (name, lat, lon, w) in CITY_BASKET:
+    for (name, lat, lon, _) in CITY_BASKET:
         dates, temps = fetch_daily_temps_f(lat, lon, PAST_DAYS, FORECAST_DAYS)
         df = compute_degree_days(dates, temps, BASE_F)
         df = df[["date", "hdd", "cdd"]].copy()
@@ -236,7 +236,6 @@ def build_composite_weather() -> pd.DataFrame:
     for df in per_city[1:]:
         merged = merged.merge(df, on="date", how="inner")
 
-    # weighted average across cities
     hdd_cols = [f"hdd_{name}" for (name, _, _, _) in CITY_BASKET]
     cdd_cols = [f"cdd_{name}" for (name, _, _, _) in CITY_BASKET]
     hdd_mat = merged[hdd_cols].to_numpy(dtype=float)
@@ -260,7 +259,7 @@ class StorageInfo:
     total_bcf: Optional[float] = None
     wow_bcf: Optional[float] = None
     bias: str = "NA"                   # DRAW / BUILD / FLAT / NA
-    vs5y_bcf: Optional[float] = None   # current - 5y avg (same week)
+    vs5y_bcf: Optional[float] = None   # current - 5y avg (same ISO week)
     note: str = ""
 
 def fetch_storage_series_v2(api_key: str, seriesid: str) -> List[dict]:
@@ -268,20 +267,19 @@ def fetch_storage_series_v2(api_key: str, seriesid: str) -> List[dict]:
     params = {"api_key": api_key}
     r = retry_get(url, params=params, tries=3, timeout=25)
     j = r.json()
-    data = j.get("response", {}).get("data", [])
-    return data or []
+    return j.get("response", {}).get("data", []) or []
 
 def compute_5y_avg_same_week(data: List[dict], latest_week: str) -> Optional[float]:
     """
     Compute 5-year average for same ISO week-of-year as latest_week,
-    excluding the latest year. Uses weekly periods (YYYY-MM-DD).
+    excluding the latest ISO year. Uses weekly periods (YYYY-MM-DD).
     """
     try:
         latest_date = dt.date.fromisoformat(latest_week)
     except Exception:
         return None
 
-    latest_iso = latest_date.isocalendar()  # (year, week, weekday)
+    latest_iso = latest_date.isocalendar()
     target_week = latest_iso.week
 
     rows = []
@@ -297,16 +295,13 @@ def compute_5y_avg_same_week(data: List[dict], latest_week: str) -> Optional[flo
         iso = d.isocalendar()
         if iso.week != target_week:
             continue
-        # exclude current year
         if iso.year == latest_iso.year:
             continue
         rows.append((d, float(v)))
 
-    # pick last 5 years closest by date (most recent five prior years)
     rows.sort(key=lambda t: t[0], reverse=True)
     vals = [v for (_, v) in rows[:5]]
     if len(vals) < 3:
-        # not enough history -> skip
         return None
     return float(np.mean(vals))
 
@@ -323,7 +318,6 @@ def fetch_storage_lower48_total(api_key: str) -> StorageInfo:
         if not data:
             raise RuntimeError("v2/seriesid empty data")
 
-        # ensure sorted by period desc
         data_sorted = sorted(data, key=lambda x: str(x.get("period", "")), reverse=True)
         latest = data_sorted[0]
         prev = data_sorted[1] if len(data_sorted) > 1 else None
@@ -352,11 +346,10 @@ def fetch_storage_lower48_total(api_key: str) -> StorageInfo:
             wow_bcf=wow,
             bias=bias,
             vs5y_bcf=vs5,
-            note="ok: v2/seriesid (Lower48 total)"
+            note="ok"
         )
     except Exception as e:
-        msg = _redact_api_key(str(e))
-        return StorageInfo(note=f"storage fetch failed: {msg}")
+        return StorageInfo(note=f"storage fetch failed: {_redact_api_key(str(e))}")
 
 
 # =========================
@@ -378,7 +371,6 @@ def calc_rsi(close: pd.Series, period: int = 14) -> Optional[float]:
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    # Wilder smoothing
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
     rs = avg_gain / (avg_loss + 1e-12)
@@ -386,16 +378,11 @@ def calc_rsi(close: pd.Series, period: int = 14) -> Optional[float]:
     return float(rsi.iloc[-1])
 
 def fetch_price_fred(series_id: str) -> PriceInfo:
-    """
-    FRED CSV (no key):
-    https://fred.stlouisfed.org/graph/fredgraph.csv?id=DHHNGSP
-    """
     try:
         url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
         params = {"id": series_id}
         r = retry_get(url, params=params, tries=3, timeout=20)
 
-        from io import StringIO
         df = pd.read_csv(StringIO(r.text))
         if df is None or df.empty or df.shape[1] < 2:
             return PriceInfo(symbol=f"FRED:{series_id}", note="fred: empty")
@@ -409,7 +396,6 @@ def fetch_price_fred(series_id: str) -> PriceInfo:
         ma20 = float(close.tail(20).mean())
         rsi14 = calc_rsi(close, 14)
 
-        # vol10 = stdev of last 10 daily returns
         ret = close.pct_change().dropna()
         vol10 = float(ret.tail(10).std()) if len(ret) >= 10 else None
 
@@ -419,14 +405,81 @@ def fetch_price_fred(series_id: str) -> PriceInfo:
 
 
 # =========================
+# CFTC COT (Managed Money crowding)
+# =========================
+@dataclass
+class COTInfo:
+    net_position: Optional[float] = None
+    zscore: Optional[float] = None
+    score: int = 0
+    note: str = ""
+
+def fetch_cot_managed_money() -> COTInfo:
+    """
+    Pull CFTC COT (Futures Only) for NYMEX Natural Gas.
+    Uses CFTC public CSV (no key).
+    Managed Money net = Long - Short.
+    Z-score over ~3 years (156 weeks).
+    """
+    try:
+        url = "https://www.cftc.gov/dea/newcot/FutOnly.csv"
+        r = retry_get(url, params={}, tries=3, timeout=35)
+        df = pd.read_csv(StringIO(r.text))
+
+        # Find Natural Gas market row (NYMEX)
+        col_market = "Market_and_Exchange_Names"
+        if col_market not in df.columns:
+            return COTInfo(note="COT schema changed (no Market_and_Exchange_Names)")
+
+        df_ng = df[df[col_market].astype(str).str.contains("NATURAL GAS", case=False, na=False)].copy()
+        if df_ng.empty:
+            return COTInfo(note="NG not found in COT")
+
+        # Columns vary slightly; handle common names
+        # Most common in FutOnly.csv:
+        # Managed_Money_Long_All, Managed_Money_Short_All
+        if "Managed_Money_Long_All" not in df_ng.columns or "Managed_Money_Short_All" not in df_ng.columns:
+            return COTInfo(note="COT schema changed (no Managed_Money_*_All columns)")
+
+        df_ng["net"] = pd.to_numeric(df_ng["Managed_Money_Long_All"], errors="coerce") - pd.to_numeric(df_ng["Managed_Money_Short_All"], errors="coerce")
+
+        date_col = "Report_Date_as_YYYY-MM-DD"
+        if date_col not in df_ng.columns:
+            return COTInfo(note="COT schema changed (no Report_Date_as_YYYY-MM-DD)")
+
+        df_ng[date_col] = pd.to_datetime(df_ng[date_col], errors="coerce")
+        df_ng = df_ng.dropna(subset=[date_col, "net"]).sort_values(date_col)
+
+        net_series = df_ng["net"].astype(float)
+        if len(net_series) < 60:
+            return COTInfo(note="COT not enough history")
+
+        latest = float(net_series.iloc[-1])
+        window = net_series.tail(156)  # ~3 years
+        mean = float(window.mean())
+        std = float(window.std()) if float(window.std()) > 0 else 1.0
+        z = (latest - mean) / std
+
+        score = 0
+        if z < -COT_Z_EXTREME:
+            score = +1   # extreme short -> squeeze risk (bullish)
+        elif z > COT_Z_EXTREME:
+            score = -1   # extreme long -> crowded long (bearish)
+
+        return COTInfo(net_position=latest, zscore=float(z), score=score, note="ok")
+    except Exception as e:
+        return COTInfo(note=f"COT failed: {e}")
+
+
+# =========================
 # REGIME + EVENT RISK
 # =========================
 def season_regime(today: dt.date) -> Tuple[str, float]:
     """
-    Return regime and weight multiplier for weather score.
+    Regime and weight multiplier for weather score.
     - winter (Nov-Mar): HDD focus, full weight
     - summer (Jun-Sep): CDD focus, full weight
-    - shoulder (Apr-May, Oct): mixed, half weight
+    - shoulder (Apr-May, Oct): mixed, down-weight
     """
     m = today.month
     if m in (11, 12, 1, 2, 3):
@@ -438,8 +491,7 @@ def season_regime(today: dt.date) -> Tuple[str, float]:
 def is_eia_event_window(now_utc: dt.datetime) -> bool:
     """
     EIA storage is typically released Thu 10:30 ET.
-    We mark a +/- 60min window around 10:30 ET as high event risk.
-    Uses America/New_York if zoneinfo available.
+    We mark 09:45-11:45 ET as high event risk.
     """
     if ZoneInfo is None:
         return False
@@ -447,32 +499,16 @@ def is_eia_event_window(now_utc: dt.datetime) -> bool:
         et = now_utc.astimezone(ZoneInfo("America/New_York"))
         if et.weekday() != 3:  # Thu
             return False
-        # window: 09:45 - 11:45 ET (wide to be safe)
         t = et.time()
-        start = dt.time(9, 45)
-        end = dt.time(11, 45)
-        return (start <= t <= end)
+        return dt.time(9, 45) <= t <= dt.time(11, 45)
     except Exception:
         return False
 
 
 # =========================
-# SIGNAL SCORING (transparent)
+# SCORING
 # =========================
-@dataclass
-class ScoreBreakdown:
-    weather_score: int
-    storage_score: int
-    price_score: int
-    total_score: int
-    confidence: float
-    note: str
-
 def score_weather(regime: str, w_rev7: float, w_rev15: float, c_rev7: float, c_rev15: float) -> Tuple[int, str]:
-    """
-    Winter: use HDD revisions; Summer: use CDD; Shoulder: require agreement
-    """
-    # normalize tiny noise
     w7 = _norm_delta(w_rev7); w15 = _norm_delta(w_rev15)
     c7 = _norm_delta(c_rev7); c15 = _norm_delta(c_rev15)
 
@@ -482,6 +518,7 @@ def score_weather(regime: str, w_rev7: float, w_rev15: float, c_rev7: float, c_r
         if w7 < 0 and w15 < 0:
             return (-2 if w7 < w15 else -1, "warmer revisions")
         return (0, "mixed revisions")
+
     if regime == "SUMMER":
         if c7 > 0 and c15 > 0:
             return (2 if c7 > c15 else 1, "hotter revisions")
@@ -489,8 +526,7 @@ def score_weather(regime: str, w_rev7: float, w_rev15: float, c_rev7: float, c_r
             return (-2 if c7 < c15 else -1, "cooler revisions")
         return (0, "mixed revisions")
 
-    # SHOULDER: only score if HDD and CDD point same direction (rare)
-    # else neutral
+    # SHOULDER
     if (w7 > 0 and w15 > 0) and (c7 <= 0 and c15 <= 0):
         return (1, "colder (shoulder)")
     if (w7 < 0 and w15 < 0) and (c7 >= 0 and c15 >= 0):
@@ -498,14 +534,6 @@ def score_weather(regime: str, w_rev7: float, w_rev15: float, c_rev7: float, c_r
     return (0, "shoulder neutral")
 
 def score_storage(s: StorageInfo) -> Tuple[int, str]:
-    """
-    Bullish:
-      - DRAW (wow<0) => +1
-      - below 5y avg => +1
-    Bearish:
-      - BUILD => -1
-      - above 5y avg => -1
-    """
     score = 0
     parts = []
 
@@ -525,17 +553,12 @@ def score_storage(s: StorageInfo) -> Tuple[int, str]:
         else:
             parts.append("near 5y")
 
-    if not parts:
-        return (0, "no storage signal")
-    return (score, ", ".join(parts))
+    return (score, ", ".join(parts) if parts else "no storage signal")
 
 def score_price(p: PriceInfo) -> Tuple[int, str]:
-    """
-    +1 if above MA20, -1 if below
-    +1 if RSI>55, -1 if RSI<45
-    """
     if p.price is None or p.ma20 is None:
         return (0, "price NA")
+
     score = 0
     parts = []
 
@@ -557,14 +580,16 @@ def score_price(p: PriceInfo) -> Tuple[int, str]:
 
     return (score, ", ".join(parts))
 
+def score_cot(c: COTInfo) -> Tuple[int, str]:
+    if c.zscore is None:
+        return (0, f"COT NA ({c.note})")
+    if c.score > 0:
+        return (c.score, f"extreme short (z={c.zscore:.2f})")
+    if c.score < 0:
+        return (c.score, f"extreme long (z={c.zscore:.2f})")
+    return (0, f"normal (z={c.zscore:.2f})")
+
 def decide_signal(regime: str, total_score: int, event_risk: bool, vol_high: bool) -> Tuple[str, str]:
-    """
-    Signal mapping:
-      Winter bias: positive => BOIL LONG, negative => KOLD LONG
-      Summer bias: positive => BOIL LONG, negative => KOLD LONG (still works as directional proxy)
-      Shoulder: require stronger score
-    Event risk or high vol -> can downgrade to WAIT unless very strong.
-    """
     strong = 3 if regime != "SHOULDER" else 4
     weak = 2 if regime != "SHOULDER" else 3
 
@@ -578,7 +603,6 @@ def decide_signal(regime: str, total_score: int, event_risk: bool, vol_high: boo
     if total_score <= -strong:
         return ("KOLD LONG (2–5D)", f"score {total_score}")
 
-    # mid scores
     if abs(total_score) >= weak:
         return ("WAIT", f"borderline score {total_score}")
 
@@ -654,7 +678,6 @@ def find_prev_same_tag(hist: pd.DataFrame, tag: str) -> Optional[pd.Series]:
     sub = hist[hist["run_tag"].astype(str) == str(tag)].copy()
     if sub.empty:
         return None
-    # last one
     return sub.iloc[-1]
 
 def run():
@@ -668,7 +691,7 @@ def run():
     # 1) Composite Weather
     comp = build_composite_weather()
 
-    # 2) Metrics (15/30 weighted)
+    # 2) Metrics
     m = compute_15_30(comp)
 
     # 3) Future windows + revisions (7D/15D, HDD & CDD)
@@ -693,26 +716,30 @@ def run():
     rev7_cdd = _norm_delta(fut7_cdd - prev_fut7_cdd)
     rev15_cdd = _norm_delta(fut15_cdd - prev_fut15_cdd)
 
-    # 4) Storage (Lower48 total + WoW + vs5y)
+    # 4) Storage
     storage = fetch_storage_lower48_total(EIA_API_KEY)
 
-    # 5) Price (FRED) + indicators
+    # 5) Price
     price = fetch_price_fred(PRICE_FRED_SERIES)
     vol_high = (price.vol10 is not None and price.vol10 > VOL10_WARN)
 
-    # 6) Regime + event risk
+    # 6) COT crowding
+    cot = fetch_cot_managed_money()
+
+    # 7) Regime + event risk
     regime, weather_mult = season_regime(today_utc)
     event_risk = is_eia_event_window(now)
 
-    # 7) Scoring
-    w_score_raw, w_note = score_weather(regime, rev7_hdd, rev15_hdd, rev7_cdd, rev15_cdd)
-    w_score = int(round(w_score_raw * weather_mult))  # shoulder down-weight
+    # 8) Scoring
+    w_raw, w_note = score_weather(regime, rev7_hdd, rev15_hdd, rev7_cdd, rev15_cdd)
+    w_score = int(round(w_raw * weather_mult))
     s_score, s_note = score_storage(storage)
     p_score, p_note = score_price(price)
+    c_score, c_note = score_cot(cot)
 
-    total_score = w_score + s_score + p_score
+    total_score = w_score + s_score + p_score + c_score
 
-    # confidence (1..10) from total_score, penalize risk
+    # Confidence (1..10)
     base_conf = 5.0 + 1.2 * abs(total_score)
     if event_risk:
         base_conf -= 1.5
@@ -724,7 +751,7 @@ def run():
 
     signal, sig_note = decide_signal(regime, total_score, event_risk, vol_high)
 
-    # 8) Save CSV
+    # 9) Save CSV
     row = {
         "run_utc": run_ts,
         "run_tag": tag,
@@ -752,21 +779,24 @@ def run():
         "ma20": price.ma20 if price.ma20 is not None else "",
         "rsi14": price.rsi14 if price.rsi14 is not None else "",
         "vol10": price.vol10 if price.vol10 is not None else "",
+        "cot_net": cot.net_position if cot.net_position is not None else "",
+        "cot_z": cot.zscore if cot.zscore is not None else "",
         "weather_score": w_score,
         "storage_score": s_score,
         "price_score": p_score,
+        "cot_score": c_score,
         "total_score": total_score,
         "signal": signal,
         "confidence": f"{confidence:.1f}/10",
-        "notes": f"weather={w_note}; storage={s_note}; price={p_note}; sig={sig_note}; "
-                 f"event_risk={event_risk}; vol_high={vol_high}; storage_note={storage.note}; price_note={price.note}",
+        "notes": f"weather={w_note}; storage={s_note}; price={p_note}; cot={c_note}; sig={sig_note}; "
+                 f"event_risk={event_risk}; vol_high={vol_high}; storage_note={storage.note}; price_note={price.note}; cot_note={cot.note}",
     }
     append_row(CSV_PATH, row)
 
-    # 9) Chart
+    # 10) Chart
     make_chart(comp, run_label, CHART_PATH)
 
-    # 10) Telegram
+    # 11) Telegram
     lines = []
     lines.append(f"📌 <b>NG Composite Update ({run_date})</b>")
     lines.append(f"• Run: <b>{tag}</b> (UTC)  | Regime: <b>{regime}</b>")
@@ -780,6 +810,7 @@ def run():
     lines.append(f"• HDD 15D: <b>{m['hdd_15d']:.2f}</b> | 30D: <b>{m['hdd_30d']:.2f}</b>")
     lines.append(f"• CDD 15D: <b>{m['cdd_15d']:.2f}</b> | 30D: <b>{m['cdd_30d']:.2f}</b>")
     lines.append("")
+
     lines.append("🧊/🔥 <b>Forecast Revision</b> (vs prior same run-tag)")
     lines.append(f"• HDD Fut7: <b>{fut7_hdd:.1f}</b> ({fmt_arrow(rev7_hdd)} {rev7_hdd:+.2f})"
                  f" | Fut15: <b>{fut15_hdd:.1f}</b> ({fmt_arrow(rev15_hdd)} {rev15_hdd:+.2f})")
@@ -814,8 +845,15 @@ def run():
         lines.append(f"📈 <b>Price</b>: NA ({price.note})")
         lines.append("")
 
-    lines.append("🧮 <b>Score</b> (Weather / Storage / Price)")
-    lines.append(f"• {w_score} / {s_score} / {p_score}  → Total: <b>{total_score}</b>")
+    lines.append("📊 <b>COT (Managed Money)</b>")
+    if cot.zscore is not None and cot.net_position is not None:
+        lines.append(f"• Net: {cot.net_position:,.0f} | Z: {cot.zscore:.2f} | Score: {c_score:+d}")
+    else:
+        lines.append(f"• NA ({cot.note})")
+    lines.append("")
+
+    lines.append("🧮 <b>Score</b> (Weather / Storage / Price / COT)")
+    lines.append(f"• {w_score} / {s_score} / {p_score} / {c_score}  → Total: <b>{total_score}</b>")
     lines.append("")
     lines.append(f"🎯 <b>Signal</b>: {signal}")
     lines.append(f"🧠 Confidence: {confidence:.1f}/10")
@@ -832,6 +870,7 @@ def run():
     print(f"[INFO] Regime={regime} event_risk={event_risk} vol_high={vol_high} total_score={total_score}")
     print(f"[INFO] Storage note: {storage.note}")
     print(f"[INFO] Price note: {price.note}")
+    print(f"[INFO] COT note: {cot.note}")
     print("[OK] Done.")
 
 if __name__ == "__main__":
