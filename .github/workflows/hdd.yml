@@ -1,10 +1,10 @@
-name: NG Composite Monitor
+name: NG Composite Monitor (2x/day)
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   schedule:
-    - cron: "20 0 * * *"
-    - cron: "20 12 * * *"
+    - cron: "20 0 * * *"   # 00:20 UTC
+    - cron: "20 12 * * *"  # 12:20 UTC
 
 concurrency:
   group: ng-composite
@@ -16,21 +16,18 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ✅ 先同步遠端最新，避免 CSV/PNG 衝突
       - name: Sync with origin/main (before running)
         run: |
           set -eux
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git pull --rebase origin main
+          git pull --rebase --autostash origin main || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,9 +46,12 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           QUANDL_API_KEY: ${{ secrets.QUANDL_API_KEY }}
-          # 可選：如果你之後發現 dataset code 不對，在這裡改
-          # COT_DATASET_CODE: "CFTC/023651_F_L_ALL"
+          # 預設不抓 COT（商用穩定）
+          ENABLE_COT: "0"
+          # 如果你之後確認 dataset 可用，再把 ENABLE_COT 改成 "1"
+          # COT_DATASET_CODE: "CFTC/067651_F_L_ALL"
         run: |
+          set -eux
           python hdd_system.py
 
       - name: Commit & push results (csv + chart)
@@ -60,11 +60,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add ng_hdd_data.csv hdd_cdd_chart.png || true
+          # 先 rebase 最新，避免衝突
+          git pull --rebase --autostash origin main || true
+
+          git add ng_composite_data.csv ng_composite_chart.png || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
           git commit -m "NG composite update"
-          git push origin HEAD:main
+
+          # push 失敗就再 sync 一次重試
+          (git push origin HEAD:main) || (git pull --rebase --autostash origin main && git push origin HEAD:main)
