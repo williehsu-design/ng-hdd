@@ -40,6 +40,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug env presence
+        run: |
+          python - <<'PY'
+          import os
+          print("TG_BOT_TOKEN set:", bool(os.getenv("TG_BOT_TOKEN")))
+          print("TG_CHAT_ID set:", bool(os.getenv("TG_CHAT_ID")))
+          print("EIA_API_KEY set:", bool(os.getenv("EIA_API_KEY")))
+          PY
+
       # ✅ 不印出 key，只印出有沒有拿到
       - name: Debug env presence
         run: |
