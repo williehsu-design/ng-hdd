@@ -52,10 +52,7 @@ def fmt_utc(ts: dt.datetime) -> str:
 
 def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requests.Response:
     last_err = None
-    headers = {
-        # light UA helps some endpoints; harmless elsewhere
-        "User-Agent": "Mozilla/5.0 (GitHubActions; HDDCDDMonitor/1.0)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions; HDDCDDMonitor/1.0)"}
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -84,12 +81,14 @@ def fmt_arrow(delta: float) -> str:
 def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: int) -> Tuple[List[str], List[float]]:
     """
     Fetch daily mean temperature (F) from Open-Meteo (UTC dates).
+    Robust against nulls: prefer mean, fallback to (max+min)/2, then ffill/bfill.
     """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "daily": "temperature_2m_mean",
+        # ✅ 同時抓 mean/max/min 避免 mean 會回 null
+        "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min",
         "temperature_unit": "fahrenheit",
         "timezone": "UTC",
         "past_days": past_days,
@@ -98,10 +97,57 @@ def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: in
     r = retry_get(url, params=params, tries=3, timeout=20)
     data = r.json()
     daily = data.get("daily", {})
-    dates = daily.get("time", [])
-    temps = daily.get("temperature_2m_mean", [])
-    if not dates or not temps or len(dates) != len(temps):
+
+    dates = daily.get("time", []) or []
+    tmean = daily.get("temperature_2m_mean", []) or []
+    tmax = daily.get("temperature_2m_max", []) or []
+    tmin = daily.get("temperature_2m_min", []) or []
+
+    if not dates:
         raise RuntimeError(f"Open-Meteo returned invalid payload: {json.dumps(daily)[:400]}")
+
+    n = len(dates)
+
+    # 保險：API 有時欄位長度會不齊，補齊到 n
+    def pad(arr):
+        arr = list(arr)
+        if len(arr) < n:
+            arr += [None] * (n - len(arr))
+        return arr[:n]
+
+    tmean = pad(tmean)
+    tmax = pad(tmax)
+    tmin = pad(tmin)
+
+    # 先用 mean，mean 缺的用 (max+min)/2 補
+    temps: List[Optional[float]] = []
+    for i in range(n):
+        v = tmean[i]
+        if v is None:
+            mx, mn = tmax[i], tmin[i]
+            if mx is not None and mn is not None:
+                v = (float(mx) + float(mn)) / 2.0
+        temps.append(float(v) if v is not None else None)
+
+    # forward fill（用前一天補）
+    last_valid = None
+    for i in range(n):
+        if temps[i] is None and last_valid is not None:
+            temps[i] = last_valid
+        elif temps[i] is not None:
+            last_valid = temps[i]
+
+    # backward fill（如果開頭就是 None）
+    next_valid = None
+    for i in range(n - 1, -1, -1):
+        if temps[i] is not None:
+            next_valid = temps[i]
+        elif temps[i] is None and next_valid is not None:
+            temps[i] = next_valid
+
+    if any(v is None for v in temps):
+        raise RuntimeError(f"Open-Meteo temps still contain nulls: {temps}")
+
     return dates, [float(x) for x in temps]
 
 
@@ -114,10 +160,6 @@ def compute_hdd_cdd_series(dates: List[str], temps_f: List[float], base_f: float
 
 
 def weighted_avg_recent(values: np.ndarray) -> float:
-    """
-    Linear-ish weighting favoring the newest data in the window.
-    values must be in chronological order (old -> new).
-    """
     n = len(values)
     if n == 0:
         return float("nan")
@@ -150,10 +192,6 @@ class StorageInfo:
 
 
 def fetch_storage_eia(api_key: str) -> StorageInfo:
-    """
-    Pull latest weekly storage using EIA v2 API.
-    If no api_key, returns NA but doesn't crash.
-    """
     if not api_key:
         return StorageInfo(note="EIA_API_KEY not set (storage skipped)")
 
@@ -178,13 +216,12 @@ def fetch_storage_eia(api_key: str) -> StorageInfo:
         week = str(row.get("period", "")) or None
         total = row.get("value", None)
 
-        info = StorageInfo(
+        return StorageInfo(
             week=week,
             total_bcf=float(total) if total is not None else None,
             bias="NA",
-            note="EIA ok"
+            note="EIA ok",
         )
-        return info
     except Exception as e:
         return StorageInfo(note=f"Storage fetch failed: {e}")
 
@@ -220,7 +257,7 @@ def fetch_price_yfinance(symbol: str) -> PriceInfo:
 
         last = float(close.iloc[-1])
         ma5 = float(close.tail(5).mean())
-        prior3 = close.iloc[-4:-1]  # previous 3 closes
+        prior3 = close.iloc[-4:-1]
         break3_high = bool(last > float(prior3.max()))
         break3_low = bool(last < float(prior3.min()))
         return PriceInfo(symbol=symbol, price=last, ma5=ma5, break3_high=break3_high, break3_low=break3_low, note="ok")
@@ -229,9 +266,6 @@ def fetch_price_yfinance(symbol: str) -> PriceInfo:
 
 
 def fetch_price_stooq(symbol_stooq: str) -> PriceInfo:
-    """
-    Stooq daily CSV: https://stooq.com/q/d/l/?s=ng.f&i=d
-    """
     try:
         url = "https://stooq.com/q/d/l/"
         params = {"s": symbol_stooq, "i": "d"}
@@ -421,7 +455,7 @@ def run():
     price = fetch_price_with_fallback(
         PRICE_SYMBOL_PRIMARY,
         PRICE_SYMBOL_FALLBACK,
-        PRICE_STOOQ_FALLBACK
+        PRICE_STOOQ_FALLBACK,
     )
 
     # 6) Signal
@@ -503,7 +537,7 @@ def run():
     tg_send_message(TG_BOT_TOKEN, TG_CHAT_ID, msg)
     tg_send_photo(TG_BOT_TOKEN, TG_CHAT_ID, CHART_PATH, caption=f"📈 Trend (HDD/CDD) · {run_date} UTC")
 
-    # console debug (helps Actions logs)
+    # console debug (Actions log)
     print("[INFO] ENV present:",
           f"TG_BOT_TOKEN={'yes' if TG_BOT_TOKEN else 'no'}",
           f"TG_CHAT_ID={'yes' if TG_CHAT_ID else 'no'}",
