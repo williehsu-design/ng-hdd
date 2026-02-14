@@ -2,7 +2,6 @@ import os
 import json
 import time
 import re
-import math
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
@@ -74,7 +73,7 @@ def fmt_utc(ts: dt.datetime) -> str:
 
 def retry_get(url: str, params: dict, tries: int = 3, timeout: int = 20) -> requests.Response:
     last_err = None
-    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions; NGMonitor/3.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions; NGMonitor/3.1)"}
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
@@ -405,7 +404,7 @@ def fetch_price_fred(series_id: str) -> PriceInfo:
 
 
 # =========================
-# CFTC COT (Managed Money crowding)
+# CFTC COT (Managed Money crowding) - UPDATED
 # =========================
 @dataclass
 class COTInfo:
@@ -416,46 +415,68 @@ class COTInfo:
 
 def fetch_cot_managed_money() -> COTInfo:
     """
-    Pull CFTC COT (Futures Only) for NYMEX Natural Gas.
-    Uses CFTC public CSV (no key).
-    Managed Money net = Long - Short.
+    Pull CFTC COT (Disaggregated Futures Only) for Natural Gas.
+    Primary: https://www.cftc.gov/dea/newcot/f_disagg.txt  (comma delimited)
+    Fallback: older endpoints if available.
+
+    We compute "Managed Money" net = long - short.
     Z-score over ~3 years (156 weeks).
     """
-    try:
-        url = "https://www.cftc.gov/dea/newcot/FutOnly.csv"
-        r = retry_get(url, params={}, tries=3, timeout=35)
-        df = pd.read_csv(StringIO(r.text))
+    def pick_col(cols: List[str], must_have: List[str]) -> Optional[str]:
+        cols_l = [(c, c.lower()) for c in cols]
+        for c, cl in cols_l:
+            ok = True
+            for w in must_have:
+                if w.lower() not in cl:
+                    ok = False
+                    break
+            if ok:
+                return c
+        return None
 
-        # Find Natural Gas market row (NYMEX)
-        col_market = "Market_and_Exchange_Names"
-        if col_market not in df.columns:
-            return COTInfo(note="COT schema changed (no Market_and_Exchange_Names)")
+    def parse_and_score(df: pd.DataFrame) -> COTInfo:
+        market_col = pick_col(df.columns.tolist(), ["market", "exchange"])
+        if not market_col:
+            return COTInfo(note="COT schema changed (no market column)")
 
-        df_ng = df[df[col_market].astype(str).str.contains("NATURAL GAS", case=False, na=False)].copy()
+        df_ng = df[df[market_col].astype(str).str.contains("NATURAL GAS", case=False, na=False)].copy()
         if df_ng.empty:
-            return COTInfo(note="NG not found in COT")
+            return COTInfo(note="NG not found in COT file")
 
-        # Columns vary slightly; handle common names
-        # Most common in FutOnly.csv:
-        # Managed_Money_Long_All, Managed_Money_Short_All
-        if "Managed_Money_Long_All" not in df_ng.columns or "Managed_Money_Short_All" not in df_ng.columns:
-            return COTInfo(note="COT schema changed (no Managed_Money_*_All columns)")
+        date_col = (
+            pick_col(df_ng.columns.tolist(), ["report_date"]) or
+            pick_col(df_ng.columns.tolist(), ["report", "date"]) or
+            pick_col(df_ng.columns.tolist(), ["as_of", "date"])
+        )
+        if not date_col:
+            return COTInfo(note="COT schema changed (no date column)")
 
-        df_ng["net"] = pd.to_numeric(df_ng["Managed_Money_Long_All"], errors="coerce") - pd.to_numeric(df_ng["Managed_Money_Short_All"], errors="coerce")
+        long_col = (
+            pick_col(df_ng.columns.tolist(), ["managed", "money", "long"]) or
+            pick_col(df_ng.columns.tolist(), ["m_money", "long"]) or
+            pick_col(df_ng.columns.tolist(), ["money", "long", "all"])
+        )
+        short_col = (
+            pick_col(df_ng.columns.tolist(), ["managed", "money", "short"]) or
+            pick_col(df_ng.columns.tolist(), ["m_money", "short"]) or
+            pick_col(df_ng.columns.tolist(), ["money", "short", "all"])
+        )
 
-        date_col = "Report_Date_as_YYYY-MM-DD"
-        if date_col not in df_ng.columns:
-            return COTInfo(note="COT schema changed (no Report_Date_as_YYYY-MM-DD)")
+        if not long_col or not short_col:
+            return COTInfo(note=f"COT schema changed (no managed money long/short). found_long={bool(long_col)} found_short={bool(short_col)}")
 
         df_ng[date_col] = pd.to_datetime(df_ng[date_col], errors="coerce")
-        df_ng = df_ng.dropna(subset=[date_col, "net"]).sort_values(date_col)
+        df_ng[long_col] = pd.to_numeric(df_ng[long_col], errors="coerce")
+        df_ng[short_col] = pd.to_numeric(df_ng[short_col], errors="coerce")
+        df_ng = df_ng.dropna(subset=[date_col, long_col, short_col]).sort_values(date_col)
 
-        net_series = df_ng["net"].astype(float)
-        if len(net_series) < 60:
+        if len(df_ng) < 60:
             return COTInfo(note="COT not enough history")
 
+        net_series = (df_ng[long_col] - df_ng[short_col]).astype(float)
         latest = float(net_series.iloc[-1])
-        window = net_series.tail(156)  # ~3 years
+
+        window = net_series.tail(156)  # ~3 years weekly
         mean = float(window.mean())
         std = float(window.std()) if float(window.std()) > 0 else 1.0
         z = (latest - mean) / std
@@ -467,8 +488,25 @@ def fetch_cot_managed_money() -> COTInfo:
             score = -1   # extreme long -> crowded long (bearish)
 
         return COTInfo(net_position=latest, zscore=float(z), score=score, note="ok")
-    except Exception as e:
-        return COTInfo(note=f"COT failed: {e}")
+
+    urls = [
+        "https://www.cftc.gov/dea/newcot/f_disagg.txt",
+        "https://www.cftc.gov/dea/newcot/FutOnly.csv",  # optional fallback; may 404
+    ]
+
+    last_err = None
+    for url in urls:
+        try:
+            r = retry_get(url, params={}, tries=3, timeout=35)
+            df = pd.read_csv(StringIO(r.text))
+            info = parse_and_score(df)
+            if info.note == "ok":
+                return info
+            last_err = info.note
+        except Exception as e:
+            last_err = f"{url} failed: {e}"
+
+    return COTInfo(note=f"COT failed: {last_err}")
 
 
 # =========================
