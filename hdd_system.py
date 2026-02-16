@@ -181,11 +181,27 @@ def compute_15_30(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 def fut_sums(df: pd.DataFrame) -> Dict[str, float]:
-    # 未來 7/15 天總 HDD/CDD（用來看 forecast revision 更直觀）
-    today = df["date"].max()
-    fut = df[df["date"] > today - pd.Timedelta(days=0)].copy()
+    # 1. 取得「現在」的 UTC 日期，並轉成 Timestamp (去除時分秒)
+    # 這樣才能跟 DataFrame 裡的 date 欄位 (格式通常是 YYYY-MM-DD 00:00:00) 對齊
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    current_date = pd.Timestamp(now_utc.date())
+
+    # 2. 篩選：只保留「今天」以後（含今天）的資料
+    # 原本錯誤寫法：df["date"] > df["date"].max() (這樣會找不到任何資料)
+    fut = df[df["date"] >= current_date].copy()
+    
+    # 重新排序確保順序正確
     fut = fut.sort_values("date").reset_index(drop=True)
 
+    # 3. 如果篩選後沒資料（例如日期格式對不上），回傳 0.0 避免報錯，但在 Log 警告
+    if fut.empty:
+        print(f"[WARN] fut_sums found no future data! Check date formats. Current: {current_date}, DF Head: {df['date'].head(1)}")
+        return {
+            "hdd_fut7": 0.0, "hdd_fut15": 0.0,
+            "cdd_fut7": 0.0, "cdd_fut15": 0.0,
+        }
+
+    # 4. 取未來 7 天與 15 天
     fut7 = fut.head(7)
     fut15 = fut.head(15)
 
