@@ -47,7 +47,7 @@ jobs:
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           QUANDL_API_KEY: ${{ secrets.QUANDL_API_KEY }}
           # 預設不抓 COT（商用穩定）
-          ENABLE_COT: "0"
+          ENABLE_COT: "1"
           # 如果你之後確認 dataset 可用，再把 ENABLE_COT 改成 "1"
           # COT_DATASET_CODE: "CFTC/067651_F_L_ALL"
         run: |
