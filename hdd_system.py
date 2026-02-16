@@ -355,10 +355,18 @@ def fetch_cot_quandl(dataset_code: str, api_key: str) -> COTInfo:
     # 商用版：就算失敗也只能回 NA，不准讓整個 job 掛
     if not api_key:
         return COTInfo(note="QUANDL_API_KEY not set")
+    
     url = f"https://data.nasdaq.com/api/v3/datasets/{dataset_code}.json"
     params = {"api_key": api_key, "rows": 5}
+    
+    # [修正1] 加入 User-Agent 避免被擋 (403 Forbidden)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
     try:
-        r = retry_get(url, params=params, tries=3, timeout=25)
+        # [修正2] 這裡傳入 headers
+        r = retry_get(url, params=params, headers=headers, tries=3, timeout=25)
         j = r.json()
         ds = j.get("dataset", {})
         cols = ds.get("column_names", [])
@@ -374,9 +382,14 @@ def fetch_cot_quandl(dataset_code: str, api_key: str) -> COTInfo:
             return COTInfo(net_managed_money=net, note="ok (nasdaq)")
         return COTInfo(note="Nasdaq COT: cannot find managed money net col")
     except Exception as e:
-        # 403 / 404 都只做 note，不要炸
-        return COTInfo(note=f"Nasdaq COT failed: {e}")
-
+        # [修正3] 淨化錯誤訊息，避免 Telegram 崩潰
+        err_msg = str(e)
+        if "<html" in err_msg.lower() or "403" in err_msg:
+            # 如果是網頁代碼，縮短訊息
+            return COTInfo(note="Nasdaq access denied (403)")
+        
+        # 只取前 50 個字，避免訊息太長
+        return COTInfo(note=f"Nasdaq COT failed: {err_msg[:50]}")
 # =========================
 # CHART
 # =========================
