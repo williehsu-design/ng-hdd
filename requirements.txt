@@ -4,3 +4,4 @@ matplotlib==3.9.2
 yfinance
 python-dateutil==2.9.0.post0
 pandas_datareader
+numpy
