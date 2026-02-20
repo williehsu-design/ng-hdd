@@ -76,7 +76,9 @@ def tg_send_message(token: str, chat_id: str, text: str) -> None:
     if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    requests.post(url, data=payload, timeout=25)
+    r = requests.post(url, data=payload, timeout=25)
+    if r.status_code >= 400:
+        print(f"TG Msg Error: {r.text}") # 幫助您在 GitHub 看到錯誤原因
 
 def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str) -> None:
     if not token or not chat_id or not os.path.exists(photo_path): return
@@ -394,11 +396,11 @@ def run():
             f"• Week: {storage.week} | Total: {storage.total_bcf:.0f} bcf",
         ])
         
-        # 加入預期差判定顯示
+        # 加入預期差判定顯示 - [修復 HTML 符號問題]
         if storage.wow_5yr_avg is not None:
             diff = storage.wow_bcf - storage.wow_5yr_avg
             lines.append(f"• WoW: <b>{wow_str} bcf</b> (vs 5Yr Avg: {storage.wow_5yr_avg:+.0f} bcf)")
-            lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (<- 多空指標)")
+            lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (多空判定)")
         else:
             lines.append(f"• WoW: {wow_str} bcf | Bias: <b>{storage.bias}</b>")
         lines.append("")
