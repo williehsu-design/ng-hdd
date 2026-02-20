@@ -56,7 +56,7 @@ def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 
         try:
             r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
             if r.status_code >= 400:
-                raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text[:200]}", response=r)
+                raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
             return r
         except Exception as e:
             last_err = e
@@ -66,13 +66,10 @@ def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 
 def safe_float_list(xs: List) -> List[float]:
     out = []
     for x in xs:
-        if x is None:
-            out.append(float("nan"))
+        if x is None: out.append(float("nan"))
         else:
-            try:
-                out.append(float(x))
-            except:
-                out.append(float("nan"))
+            try: out.append(float(x))
+            except: out.append(float("nan"))
     return out
 
 def tg_send_message(token: str, chat_id: str, text: str) -> None:
@@ -128,46 +125,38 @@ def weighted_avg_recent(values: np.ndarray) -> float:
 def compute_15_30(df: pd.DataFrame) -> Dict[str, float]:
     last15, last30 = df.tail(15).sort_values("date"), df.tail(30).sort_values("date")
     return {
-        "hdd_15d": weighted_avg_recent(last15["hdd"].to_numpy()),
-        "hdd_30d": weighted_avg_recent(last30["hdd"].to_numpy()),
-        "cdd_15d": weighted_avg_recent(last15["cdd"].to_numpy()),
-        "cdd_30d": weighted_avg_recent(last30["cdd"].to_numpy()),
+        "hdd_15d": weighted_avg_recent(last15["hdd"].to_numpy()), "hdd_30d": weighted_avg_recent(last30["hdd"].to_numpy()),
+        "cdd_15d": weighted_avg_recent(last15["cdd"].to_numpy()), "cdd_30d": weighted_avg_recent(last30["cdd"].to_numpy()),
     }
 
 def fut_sums(df: pd.DataFrame) -> Dict[str, float]:
     current_date = pd.Timestamp(dt.datetime.now(dt.timezone.utc).date())
     fut = df[df["date"] >= current_date].sort_values("date").reset_index(drop=True)
-    if fut.empty:
-        return {"hdd_fut7": 0.0, "hdd_fut15": 0.0, "cdd_fut7": 0.0, "cdd_fut15": 0.0}
+    if fut.empty: return {"hdd_fut7": 0.0, "hdd_fut15": 0.0, "cdd_fut7": 0.0, "cdd_fut15": 0.0}
     return {
-        "hdd_fut7": float(fut.head(7)["hdd"].sum()),
-        "hdd_fut15": float(fut.head(15)["hdd"].sum()),
-        "cdd_fut7": float(fut.head(7)["cdd"].sum()),
-        "cdd_fut15": float(fut.head(15)["cdd"].sum()),
+        "hdd_fut7": float(fut.head(7)["hdd"].sum()), "hdd_fut15": float(fut.head(15)["hdd"].sum()),
+        "cdd_fut7": float(fut.head(7)["cdd"].sum()), "cdd_fut15": float(fut.head(15)["cdd"].sum()),
     }
 
 # =========================
-# STORAGE (EIA v2 終極無腦抓取版)
+# STORAGE (5-Year Avg 對比版)
 # =========================
 @dataclass
 class StorageInfo:
     week: Optional[str] = None
     total_bcf: Optional[float] = None
     wow_bcf: Optional[float] = None
+    wow_5yr_avg: Optional[float] = None
     bias: str = "NA"
     note: str = ""
 
 def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     if not api_key: return StorageInfo(note="EIA_API_KEY not set")
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-    # 完全移除 facets 篩選，直接拿最新 50 筆原始數據
+    # 一次抓 2500 筆，涵蓋各區域過去 6 年的數據，以供計算 5 年同期平均
     params = {
-        "api_key": api_key,
-        "frequency": "weekly",
-        "data[0]": "value",
-        "sort[0][column]": "period",
-        "sort[0][direction]": "desc",
-        "length": 50
+        "api_key": api_key, "frequency": "weekly", "data[0]": "value",
+        "sort[0][column]": "period", "sort[0][direction]": "desc", "length": 2500
     }
     r = retry_get(url, params=params)
     if isinstance(r, str): return StorageInfo(note=f"API Error: {r[:40]}")
@@ -175,18 +164,14 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     data = r.json().get("response", {}).get("data", [])
     if not data: return StorageInfo(note="EIA empty data")
     
-    # 動態分組找最大值：因為 Total Lower 48 必定大於任何單一地區
+    # 動態分組找每週最大值 (Total Lower 48)
     period_max = {}
     for d in data:
         p = str(d.get("period", ""))
         try:
-            val_raw = d.get("value")
-            if val_raw is None: continue
-            v = float(val_raw)
-            if p not in period_max or v > period_max[p]:
-                period_max[p] = v
-        except:
-            continue
+            v = float(d.get("value"))
+            if p not in period_max or v > period_max[p]: period_max[p] = v
+        except: continue
             
     sorted_periods = sorted(period_max.keys(), reverse=True)
     if not sorted_periods: return StorageInfo(note="No valid periods")
@@ -196,7 +181,28 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     prev_val = period_max[sorted_periods[1]] if len(sorted_periods) > 1 else curr_val
     wow = curr_val - prev_val
     
-    return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, bias="DRAW" if wow < 0 else "BUILD", note="ok")
+    # 計算 5 年同期平均 WoW
+    wow_5yr_avg = None
+    try:
+        curr_date = dt.datetime.strptime(curr_period, "%Y-%m-%d")
+        curr_week_num = curr_date.isocalendar()[1]
+        historical_wows = []
+        
+        for i in range(1, len(sorted_periods)):
+            p_date = dt.datetime.strptime(sorted_periods[i], "%Y-%m-%d")
+            # 找到過去年份「相同週數」的數據
+            if p_date.year < curr_date.year and p_date.isocalendar()[1] == curr_week_num:
+                if i + 1 < len(sorted_periods):
+                    h_curr = period_max[sorted_periods[i]]
+                    h_prev = period_max[sorted_periods[i+1]]
+                    historical_wows.append(h_curr - h_prev)
+                if len(historical_wows) == 5: break # 抓滿 5 年就停
+                
+        if historical_wows:
+            wow_5yr_avg = sum(historical_wows) / len(historical_wows)
+    except: pass
+    
+    return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, wow_5yr_avg=wow_5yr_avg, bias="DRAW" if wow < 0 else "BUILD", note="ok")
 
 # =========================
 # PRICE
@@ -290,15 +296,29 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
     plt.close(fig)
 
 # =========================
-# SIGNAL
+# SIGNAL (預期差判定系統)
 # =========================
 def score_system(d_hdd_fut7, storage, price, cot) -> Tuple[int, int, int, int, int, str]:
     w = 2 if d_hdd_fut7 > 0.1 else -2 if d_hdd_fut7 < -0.1 else 0
-    s = 2 if storage.wow_bcf is not None and storage.wow_bcf < -10 else -2 if storage.wow_bcf is not None and storage.wow_bcf > 10 else 0
+    
+    # [神級修正] 依據實際值與5年平均值的差距給分
+    s = 0
+    if storage.wow_bcf is not None and storage.wow_5yr_avg is not None:
+        diff = storage.wow_bcf - storage.wow_5yr_avg
+        # 實際值減去預期值。如果是負數，代表提款更多，利多 (Bullish)
+        if diff <= -15: s = 2
+        elif diff <= -5: s = 1
+        # 如果是正數，代表提款更少（或注氣更多），利空 (Bearish)
+        elif diff >= 15: s = -2
+        elif diff >= 5: s = -1
+    elif storage.wow_bcf is not None:
+        s = 2 if storage.wow_bcf < -10 else -2 if storage.wow_bcf > 10 else 0
+
     p = 2 if price.close is not None and price.ma20 is not None and price.close > price.ma20 else -2 if price.close is not None else 0
     c = 1 if cot.net_managed_money is not None and cot.net_managed_money > 0 else -1 if cot.net_managed_money is not None else 0
+    
     total = w + s + p + c
-    sig = "BOIL LONG (2–5D)" if total >= 4 else "KOLD LONG (2–5D)" if total <= -4 else "WAIT"
+    sig = "BOIL LONG (2–5D)" if total >= 3 else "KOLD LONG (2–5D)" if total <= -3 else "WAIT"
     return w, s, p, c, total, sig
 
 # =========================
@@ -348,7 +368,6 @@ def run():
     append_row(CSV_PATH, row)
     make_chart(wdf, f"{run_date} · {run_tag}", CHART_PATH)
 
-    wow_str = "NA" if storage.wow_bcf is None else f"{storage.wow_bcf:+.0f} bcf"
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ma20_str = f"{price.ma20:.3f}" if price.ma20 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
@@ -369,12 +388,20 @@ def run():
     ]
 
     if storage.week and storage.total_bcf is not None:
+        wow_str = f"{storage.wow_bcf:+.0f}" if storage.wow_bcf is not None else "NA"
         lines.extend([
-            "🧱 <b>Storage</b> (EIA · Lower 48 Total)",
+            "🧱 <b>Storage (EIA · Lower 48 Total)</b>",
             f"• Week: {storage.week} | Total: {storage.total_bcf:.0f} bcf",
-            f"• WoW: {wow_str} | Bias: <b>{storage.bias}</b>",
-            ""
         ])
+        
+        # 加入預期差判定顯示
+        if storage.wow_5yr_avg is not None:
+            diff = storage.wow_bcf - storage.wow_5yr_avg
+            lines.append(f"• WoW: <b>{wow_str} bcf</b> (vs 5Yr Avg: {storage.wow_5yr_avg:+.0f} bcf)")
+            lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (<- 多空指標)")
+        else:
+            lines.append(f"• WoW: {wow_str} bcf | Bias: <b>{storage.bias}</b>")
+        lines.append("")
     else:
         lines.extend(["🧱 <b>Storage</b>: NA", f"• Note: {storage.note}", ""])
 
