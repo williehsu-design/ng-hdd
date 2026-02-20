@@ -21,11 +21,10 @@ CSV_PATH = "ng_composite_data.csv"
 CHART_PATH = "ng_composite_chart.png"
 
 PAST_DAYS = 14
-FORECAST_DAYS = 16  # past+forecast+today 約31天
+FORECAST_DAYS = 16
 
 PRICE_SYMBOL_PRIMARY = "NG=F"
 PRICE_SYMBOL_FALLBACK = "UNG"
-FRED_SERIES_FALLBACK = "DHHNGSP"
 
 # =========================
 # ENV (GitHub Secrets)
@@ -51,7 +50,7 @@ def fmt_arrow(delta: float) -> str:
     if delta < -0.001: return "⬇️"
     return "➖"
 
-def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 3, timeout: int = 25) -> requests.Response:
+def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 3, timeout: int = 25):
     last_err = None
     for i in range(tries):
         try:
@@ -62,7 +61,7 @@ def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 
         except Exception as e:
             last_err = e
             time.sleep(1.0 + i * 0.8)
-    raise RuntimeError(f"HTTP request failed after {tries} tries: {last_err}")
+    return str(last_err)
 
 def safe_float_list(xs: List) -> List[float]:
     out = []
@@ -72,7 +71,7 @@ def safe_float_list(xs: List) -> List[float]:
         else:
             try:
                 out.append(float(x))
-            except Exception:
+            except:
                 out.append(float("nan"))
     return out
 
@@ -110,6 +109,7 @@ def fetch_daily_mean_f(lat: float, lon: float, past_days: int, forecast_days: in
         "past_days": past_days, "forecast_days": forecast_days,
     }
     r = retry_get(url, params=params)
+    if isinstance(r, str): return [], []
     data = r.json().get("daily", {})
     return data.get("time", []), safe_float_list(data.get("temperature_2m_mean", []))
 
@@ -147,7 +147,7 @@ def fut_sums(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 # =========================
-# STORAGE (EIA v2 修正版)
+# STORAGE (EIA v2 終極無腦抓取版)
 # =========================
 @dataclass
 class StorageInfo:
@@ -160,39 +160,46 @@ class StorageInfo:
 def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     if not api_key: return StorageInfo(note="EIA_API_KEY not set")
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-    # [修復 1] 加入 facets 確保鎖定全美總量 (Lower 48)
+    # 完全移除 facets 篩選，直接拿最新 50 筆原始數據
     params = {
         "api_key": api_key,
         "frequency": "weekly",
         "data[0]": "value",
-        "facets[series][]": "NW_NW_SWO_NG_R48_BCF",
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
-        "offset": 0,
-        "length": 2,
+        "length": 50
     }
-    try:
-        r = retry_get(url, params=params)
-        rows = r.json().get("response", {}).get("data", [])
-        if not rows: return StorageInfo(note="EIA empty data")
-
-        week = str(rows[0].get("period", ""))
-        total = float(rows[0].get("value", 0))
-        wow = None
-        bias = "NA"
-
-        if len(rows) >= 2:
-            wow = total - float(rows[1].get("value", total))
-            if wow < 0: bias = "DRAW"
-            elif wow > 0: bias = "BUILD"
-            else: bias = "FLAT"
-
-        return StorageInfo(week=week, total_bcf=total, wow_bcf=wow, bias=bias, note="ok")
-    except Exception as e:
-        return StorageInfo(note=f"EIA Error: {str(e)[:40]}")
+    r = retry_get(url, params=params)
+    if isinstance(r, str): return StorageInfo(note=f"API Error: {r[:40]}")
+    
+    data = r.json().get("response", {}).get("data", [])
+    if not data: return StorageInfo(note="EIA empty data")
+    
+    # 動態分組找最大值：因為 Total Lower 48 必定大於任何單一地區
+    period_max = {}
+    for d in data:
+        p = str(d.get("period", ""))
+        try:
+            val_raw = d.get("value")
+            if val_raw is None: continue
+            v = float(val_raw)
+            if p not in period_max or v > period_max[p]:
+                period_max[p] = v
+        except:
+            continue
+            
+    sorted_periods = sorted(period_max.keys(), reverse=True)
+    if not sorted_periods: return StorageInfo(note="No valid periods")
+    
+    curr_period = sorted_periods[0]
+    curr_val = period_max[curr_period]
+    prev_val = period_max[sorted_periods[1]] if len(sorted_periods) > 1 else curr_val
+    wow = curr_val - prev_val
+    
+    return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, bias="DRAW" if wow < 0 else "BUILD", note="ok")
 
 # =========================
-# PRICE (修正 yfinance 警告)
+# PRICE
 # =========================
 @dataclass
 class PriceInfo:
@@ -218,7 +225,6 @@ def fetch_price_yfinance(symbol: str) -> Optional[np.ndarray]:
         import yfinance as yf
         df = yf.download(symbol, period="3mo", interval="1d", progress=False)
         if df is None or df.empty: return None
-        # 確保擠壓成 1D 陣列，避免 FutureWarning
         return df["Close"].squeeze().dropna().values
     except: return None
 
@@ -230,16 +236,12 @@ def build_price_info() -> PriceInfo:
         sym = PRICE_SYMBOL_FALLBACK
 
     if close_arr is not None and len(close_arr) >= 25:
-        # [修復 2] 直接用 numpy 取值，徹底避開 pandas 的 FutureWarning
         close_val = float(close_arr[-1])
         ma20_val = float(np.mean(close_arr[-20:]))
         rsi_val = compute_rsi(close_arr, 14)
-        
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
-
         return PriceInfo(source="YF", symbol=sym, close=close_val, ma20=ma20_val, rsi14=rsi_val, vol10=vol_val, note="ok")
-
     return PriceInfo(source="NA", symbol="NA", note="price fail")
 
 # =========================
@@ -256,6 +258,7 @@ def fetch_cot_quandl(dataset_code: str, api_key: str) -> COTInfo:
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = retry_get(url, params={"api_key": api_key, "rows": 5}, headers=headers)
+        if isinstance(r, str): return COTInfo(note=r[:30])
         ds = r.json().get("dataset", {})
         cols, data = ds.get("column_names", []), ds.get("data", [])
         if not cols or not data: return COTInfo(note="Empty")
@@ -345,7 +348,6 @@ def run():
     append_row(CSV_PATH, row)
     make_chart(wdf, f"{run_date} · {run_tag}", CHART_PATH)
 
-    # [修復 3] 預先將數值轉為安全字串，避開 f-string 的 ValueError
     wow_str = "NA" if storage.wow_bcf is None else f"{storage.wow_bcf:+.0f} bcf"
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ma20_str = f"{price.ma20:.3f}" if price.ma20 is not None else "NA"
