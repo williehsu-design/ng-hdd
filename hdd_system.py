@@ -78,7 +78,7 @@ def tg_send_message(token: str, chat_id: str, text: str) -> None:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     r = requests.post(url, data=payload, timeout=25)
     if r.status_code >= 400:
-        print(f"TG Msg Error: {r.text}") # 幫助您在 GitHub 看到錯誤原因
+        print(f"TG Msg Error: {r.text}")
 
 def tg_send_photo(token: str, chat_id: str, photo_path: str, caption: str) -> None:
     if not token or not chat_id or not os.path.exists(photo_path): return
@@ -155,7 +155,6 @@ class StorageInfo:
 def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     if not api_key: return StorageInfo(note="EIA_API_KEY not set")
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-    # 一次抓 2500 筆，涵蓋各區域過去 6 年的數據，以供計算 5 年同期平均
     params = {
         "api_key": api_key, "frequency": "weekly", "data[0]": "value",
         "sort[0][column]": "period", "sort[0][direction]": "desc", "length": 2500
@@ -166,7 +165,6 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     data = r.json().get("response", {}).get("data", [])
     if not data: return StorageInfo(note="EIA empty data")
     
-    # 動態分組找每週最大值 (Total Lower 48)
     period_max = {}
     for d in data:
         p = str(d.get("period", ""))
@@ -183,7 +181,6 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     prev_val = period_max[sorted_periods[1]] if len(sorted_periods) > 1 else curr_val
     wow = curr_val - prev_val
     
-    # 計算 5 年同期平均 WoW
     wow_5yr_avg = None
     try:
         curr_date = dt.datetime.strptime(curr_period, "%Y-%m-%d")
@@ -192,13 +189,12 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
         
         for i in range(1, len(sorted_periods)):
             p_date = dt.datetime.strptime(sorted_periods[i], "%Y-%m-%d")
-            # 找到過去年份「相同週數」的數據
             if p_date.year < curr_date.year and p_date.isocalendar()[1] == curr_week_num:
                 if i + 1 < len(sorted_periods):
                     h_curr = period_max[sorted_periods[i]]
                     h_prev = period_max[sorted_periods[i+1]]
                     historical_wows.append(h_curr - h_prev)
-                if len(historical_wows) == 5: break # 抓滿 5 年就停
+                if len(historical_wows) == 5: break 
                 
         if historical_wows:
             wow_5yr_avg = sum(historical_wows) / len(historical_wows)
@@ -303,14 +299,11 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
 def score_system(d_hdd_fut7, storage, price, cot) -> Tuple[int, int, int, int, int, str]:
     w = 2 if d_hdd_fut7 > 0.1 else -2 if d_hdd_fut7 < -0.1 else 0
     
-    # [神級修正] 依據實際值與5年平均值的差距給分
     s = 0
     if storage.wow_bcf is not None and storage.wow_5yr_avg is not None:
         diff = storage.wow_bcf - storage.wow_5yr_avg
-        # 實際值減去預期值。如果是負數，代表提款更多，利多 (Bullish)
         if diff <= -15: s = 2
         elif diff <= -5: s = 1
-        # 如果是正數，代表提款更少（或注氣更多），利空 (Bearish)
         elif diff >= 15: s = -2
         elif diff >= 5: s = -1
     elif storage.wow_bcf is not None:
@@ -370,6 +363,30 @@ def run():
     append_row(CSV_PATH, row)
     make_chart(wdf, f"{run_date} · {run_tag}", CHART_PATH)
 
+    # =========================
+    # 🚨 動態警示系統 (ALERTS)
+    # =========================
+    alerts = []
+    
+    if price.rsi14 is not None:
+        if price.rsi14 < 25:
+            alerts.append(f"⚠️ <b>極度超賣 (RSI={price.rsi14:.1f})</b>：空頭動能衰竭，慎防報復性反彈！")
+        elif price.rsi14 > 75:
+            alerts.append(f"⚠️ <b>極度超買 (RSI={price.rsi14:.1f})</b>：多頭過熱，慎防高檔暴跌！")
+            
+    if price.vol10 is not None and price.vol10 > 0.60:
+        alerts.append(f"⚠️ <b>波動率失控 (Vol10={price.vol10*100:.1f}%)</b>：盤勢不穩，建議縮小留倉部位。")
+
+    if abs(d_hdd_fut7) >= 10.0:
+        dir_str = "轉冷" if d_hdd_fut7 > 0 else "轉暖"
+        alerts.append(f"⚠️ <b>氣象突變</b>：預報大幅{dir_str} (變化 {d_hdd_fut7:+.1f} HDD)！")
+
+    if now.weekday() == 4: # 4 代表星期五
+        alerts.append("⚠️ <b>週末跳空風險</b>：今日為週五，請評估戰局/氣象突變風險，切忌滿倉過週末！")
+
+    # =========================
+    # 組合 Telegram 訊息
+    # =========================
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ma20_str = f"{price.ma20:.3f}" if price.ma20 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
@@ -378,7 +395,16 @@ def run():
     lines = [
         f"📌 <b>NG Composite Update ({run_date})</b>",
         f"• Run: <b>{run_tag}</b>",
-        "",
+        ""
+    ]
+    
+    # 插入警示區塊
+    if alerts:
+        lines.append("🚨 <b>系統特別警示 (ALERTS)</b>")
+        lines.extend(alerts)
+        lines.append("")
+
+    lines.extend([
         f"🌡️ <b>Composite HDD/CDD</b> (base {BASE_F:.0f}F)",
         f"• HDD 15D: <b>{m['hdd_15d']:.2f}</b> | 30D: <b>{m['hdd_30d']:.2f}</b>",
         f"• CDD 15D: <b>{m['cdd_15d']:.2f}</b> | 30D: <b>{m['cdd_30d']:.2f}</b>",
@@ -387,7 +413,7 @@ def run():
         f"• HDD Fut7: <b>{f['hdd_fut7']:.1f}</b> ({fmt_arrow(d_hdd_fut7)} {d_hdd_fut7:+.2f})",
         f"• CDD Fut7: <b>{f['cdd_fut7']:.1f}</b> ({fmt_arrow(d_cdd_fut7)} {d_cdd_fut7:+.2f})",
         "",
-    ]
+    ])
 
     if storage.week and storage.total_bcf is not None:
         wow_str = f"{storage.wow_bcf:+.0f}" if storage.wow_bcf is not None else "NA"
@@ -396,11 +422,17 @@ def run():
             f"• Week: {storage.week} | Total: {storage.total_bcf:.0f} bcf",
         ])
         
-        # 加入預期差判定顯示 - [修復 HTML 符號問題]
         if storage.wow_5yr_avg is not None:
             diff = storage.wow_bcf - storage.wow_5yr_avg
             lines.append(f"• WoW: <b>{wow_str} bcf</b> (vs 5Yr Avg: {storage.wow_5yr_avg:+.0f} bcf)")
             lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (多空判定)")
+            
+            # 加入庫存爆雷警示 (必須在這裡算 diff)
+            if diff >= 30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
+                lines.insert(lines.index("🚨 <b>系統特別警示 (ALERTS)</b>") + 1, f"⚠️ <b>庫存大爆雷</b>：提款遠不及預期 (多出 {diff:+.0f} bcf)，極度利空！")
+            elif diff <= -30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
+                lines.insert(lines.index("🚨 <b>系統特別警示 (ALERTS)</b>") + 1, f"⚠️ <b>庫存大驚喜</b>：提款遠超預期 (短少 {diff:+.0f} bcf)，極度利多！")
+                
         else:
             lines.append(f"• WoW: {wow_str} bcf | Bias: <b>{storage.bias}</b>")
         lines.append("")
