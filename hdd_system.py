@@ -46,8 +46,8 @@ def fmt_utc(ts: dt.datetime) -> str:
     return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def fmt_arrow(delta: float) -> str:
-    if delta > 0.001: return "⬆️"
-    if delta < -0.001: return "⬇️"
+    if delta > 0.1: return "⬆️"
+    if delta < -0.1: return "⬇️"
     return "➖"
 
 def retry_get(url: str, params: dict = None, headers: dict = None, tries: int = 3, timeout: int = 25):
@@ -249,7 +249,6 @@ def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
         df['Ret_NG'] = df['Close'].pct_change()
         df['Ret_UNG'] = df['Close_UNG'].pct_change()
 
-        # 設定閾值為 4% = 0.04 落差
         threshold = 0.04
         anomaly_mask = (df['Ret_NG'] - df['Ret_UNG']).abs() > threshold
 
@@ -257,7 +256,7 @@ def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
         df.loc[anomaly_mask, 'Fixed_Ret'] = df.loc[anomaly_mask, 'Ret_UNG']
 
         adj_close = np.zeros(len(df))
-        adj_close[-1] = df['Close'].iloc[-1]  # 錨定當下真實最新報價
+        adj_close[-1] = df['Close'].iloc[-1]
 
         for i in range(len(df)-2, -1, -1):
             adj_close[i] = adj_close[i+1] / (1 + df['Fixed_Ret'].iloc[i+1])
@@ -340,16 +339,15 @@ def check_macro_risk() -> MacroRiskInfo:
             vix_change = (hist_vix.iloc[-1] / hist_vix.iloc[-2]) - 1.0
             vix_current = float(hist_vix.iloc[-1])
             
-            # 1. 雙重確認：原油漲 > 3.5% 且 VIX 漲 > 10% (股油雙殺恐慌)
+            # 1. 雙重確認：原油漲 > 3.5% 且 VIX 漲 > 10%
             cond_double = (oil_change > 0.035) and (vix_change > 0.10)
             
-            # 2. 原油極端：單日飆升 > 5.5% (實質性斷供威脅)
+            # 2. 原油極端：單日飆升 > 5.5%
             cond_oil_extreme = (oil_change > 0.055)
             
-            # 3. VIX 極端恐慌：單日飆漲 > 20% 且 絕對值 > 20 (避險情緒炸裂)
+            # 3. VIX 極端恐慌：單日飆漲 > 20% 且 絕對值 > 20
             cond_vix_extreme = (vix_change > 0.20) and (vix_current > 20.0)
             
-            # 滿足任一條件即觸發
             is_risk_high = cond_double or cond_oil_extreme or cond_vix_extreme
             
             return MacroRiskInfo(
@@ -426,12 +424,9 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     p = 2 if price.close is not None and price.ma20 is not None and price.close > price.ma20 else -2 if price.close is not None else 0
     c = 1 if cot.net_managed_money is not None and cot.net_managed_money > 0 else -1 if cot.net_managed_money is not None else 0
     
-    # 💥 地緣風險分數覆寫 (Override)
     macro_score = 4 if macro.is_war_risk_high else 0 
-    
     total = w + s + p + c + macro_score
     
-    # 決定訊號
     if macro.is_war_risk_high:
         sig = "BOIL LONG (WAR RISK OVERRIDE)"
     elif total >= 3:
@@ -469,12 +464,15 @@ def run():
     price = build_price_info()
     cot = fetch_cot_quandl(COT_DATASET_CODE, QUANDL_API_KEY) if ENABLE_COT else COTInfo()
     
-    # 執行宏觀地緣風險檢查
     macro = check_macro_risk()
-
     w_score, s_score, p_score, c_score, m_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot, macro)
 
-    # 將數據寫入 CSV
+    # =========================
+    # 動態隱藏數值 (數值極小時不顯示)
+    # =========================
+    show_hdd = (m['hdd_30d'] + f['hdd_fut7']) > 0.5
+    show_cdd = (m['cdd_30d'] + f['cdd_fut7']) > 0.5
+
     row = {
         "run_utc": run_ts, "date_utc": run_date, "run_tag": run_tag, "regime": "WINTER" if now.month in [11, 12, 1, 2, 3] else "SUMMER",
         "hdd_15d": round(m["hdd_15d"], 2), "hdd_30d": round(m["hdd_30d"], 2),
@@ -504,9 +502,8 @@ def run():
     # =========================
     alerts = []
     
-    # 💣 地緣政治/宏觀風險最高級別警報
     if macro.is_war_risk_high:
-        alerts.append(f"☢️ <b>地緣政治核彈警報</b>：偵測到避險資產異常飆升！原油單日變化 {macro.oil_change_pct*100:+.2f}%，VIX 變化 {macro.vix_change_pct*100:+.2f}%。系統已強制啟動防禦機制，推翻天氣空頭訊號！")
+        alerts.append(f"☢️ <b>地緣政治核彈警報</b>：偵測到避險資產異常飆升！原油單日變化 {macro.oil_change_pct*100:+.2f}%，VIX 變化 {macro.vix_change_pct*100:+.2f}%。系統已強制啟動防禦機制！")
 
     if price.close is not None and price.kc_upper is not None and price.kc_lower is not None:
         if price.close > price.kc_upper:
@@ -527,11 +524,11 @@ def run():
         dir_str = "轉冷" if d_hdd_fut7 > 0 else "轉暖"
         alerts.append(f"⚠️ <b>氣象突變</b>：預報大幅{dir_str} (變化 {d_hdd_fut7:+.1f} HDD)！")
 
-    if now.weekday() == 4: # 4 代表星期五
+    if now.weekday() == 4:
         alerts.append("⚠️ <b>週末跳空風險</b>：今日為週五，請評估戰局/氣象突變風險，切忌滿倉過週末！")
 
     # =========================
-    # 組合 Telegram 訊息
+    # 組合 Telegram 訊息 (版面精簡化)
     # =========================
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ema20_str = f"{price.ema20:.3f}" if price.ema20 is not None else "NA"
@@ -539,7 +536,7 @@ def run():
     p_kc_dn_str = f"{price.kc_lower:.3f}" if price.kc_lower is not None else "NA"
     p_atr_str = f"{price.atr14:.3f}" if price.atr14 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
-    p_vol_str = f"{price.vol10*100:.2f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
+    p_vol_str = f"{price.vol10*100:.1f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
 
     lines = [
         f"📌 <b>NG Composite Update ({run_date})</b>",
@@ -547,59 +544,55 @@ def run():
         ""
     ]
     
-    # 插入警示區塊
     if alerts:
         lines.append("🚨 <b>系統特別警示 (ALERTS)</b>")
         lines.extend(alerts)
         lines.append("")
 
-    lines.extend([
-        f"🌡️ <b>Composite HDD/CDD</b> (base {BASE_F:.0f}F)",
-        f"• HDD 15D: <b>{m['hdd_15d']:.2f}</b> | 30D: <b>{m['hdd_30d']:.2f}</b>",
-        f"• CDD 15D: <b>{m['cdd_15d']:.2f}</b> | 30D: <b>{m['cdd_30d']:.2f}</b>",
-        "",
-        "🧊/🔥 <b>Forecast Revision</b>",
-        f"• HDD Fut7: <b>{f['hdd_fut7']:.1f}</b> ({fmt_arrow(d_hdd_fut7)} {d_hdd_fut7:+.2f})",
-        f"• CDD Fut7: <b>{f['cdd_fut7']:.1f}</b> ({fmt_arrow(d_cdd_fut7)} {d_cdd_fut7:+.2f})",
-        "",
-    ])
+    # === 天氣區塊精簡 (動態隱藏) ===
+    lines.append(f"🌡️ <b>Weather Demand</b> (base {BASE_F:.0f}F)")
+    if show_hdd:
+        lines.append(f"• HDD 15D/30D: <b>{m['hdd_15d']:.1f}</b> / {m['hdd_30d']:.1f}")
+    if show_cdd:
+        lines.append(f"• CDD 15D/30D: <b>{m['cdd_15d']:.1f}</b> / {m['cdd_30d']:.1f}")
+    lines.append("")
 
+    lines.append("🧊/🔥 <b>Forecast Revision (7D)</b>")
+    if show_hdd:
+        lines.append(f"• HDD: <b>{f['hdd_fut7']:.1f}</b> ({fmt_arrow(d_hdd_fut7)} {d_hdd_fut7:+.1f})")
+    if show_cdd:
+        lines.append(f"• CDD: <b>{f['cdd_fut7']:.1f}</b> ({fmt_arrow(d_cdd_fut7)} {d_cdd_fut7:+.1f})")
+    lines.append("")
+
+    # === 庫存區塊 ===
     if storage.week and storage.total_bcf is not None:
         wow_str = f"{storage.wow_bcf:+.0f}" if storage.wow_bcf is not None else "NA"
         lines.extend([
-            "🧱 <b>Storage (EIA · Lower 48 Total)</b>",
+            "🧱 <b>Storage (EIA Total)</b>",
             f"• Week: {storage.week} | Total: {storage.total_bcf:.0f} bcf",
         ])
-        
         if storage.wow_5yr_avg is not None:
             diff = storage.wow_bcf - storage.wow_5yr_avg
             lines.append(f"• WoW: <b>{wow_str} bcf</b> (vs 5Yr Avg: {storage.wow_5yr_avg:+.0f} bcf)")
-            lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (多空判定)")
-            
-            # 加入庫存爆雷警示
-            if diff >= 30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
-                lines.insert(lines.index("🚨 <b>系統特別警示 (ALERTS)</b>") + 1, f"⚠️ <b>庫存大爆雷</b>：提款遠不及預期 (多出 {diff:+.0f} bcf)，極度利空！")
-            elif diff <= -30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
-                lines.insert(lines.index("🚨 <b>系統特別警示 (ALERTS)</b>") + 1, f"⚠️ <b>庫存大驚喜</b>：提款遠超預期 (短少 {diff:+.0f} bcf)，極度利多！")
-                
+            lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b>")
         else:
             lines.append(f"• WoW: {wow_str} bcf | Bias: <b>{storage.bias}</b>")
         lines.append("")
     else:
         lines.extend(["🧱 <b>Storage</b>: NA", f"• Note: {storage.note}", ""])
 
+    # === 宏觀與價格區塊 ===
     lines.extend([
         "🛡️ <b>Macro Risk (Oil / VIX)</b>",
-        f"• WTI Crude: <b>{macro.oil_change_pct*100:+.2f}%</b>",
-        f"• VIX Fear: <b>{macro.vix_change_pct*100:+.2f}%</b>",
+        f"• WTI: <b>{macro.oil_change_pct*100:+.1f}%</b> | VIX: <b>{macro.vix_change_pct*100:+.1f}%</b>",
         f"• War Risk Triggered: <b>{'YES ☢️' if macro.is_war_risk_high else 'NO 🟢'}</b>",
         "",
         f"📈 <b>Price</b> ({price.symbol})",
-        f"• Close: <b>{p_close_str}</b> | EMA20(中軌): {p_ema20_str}",
-        f"• KC 上軌: <b>{p_kc_up_str}</b> | KC 下軌: <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
+        f"• Close: <b>{p_close_str}</b> | EMA20: {p_ema20_str}",
+        f"• KC 軌道: <b>{p_kc_up_str}</b> / <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
         "",
-        "🧮 <b>Score</b> (Weather / Storage / Price / COT / Macro)",
+        "🧮 <b>Score</b> (W / S / P / C / M)",
         f"• {w_score} / {s_score} / {p_score} / {c_score} / {m_score}  → Total: <b>{total_score}</b>",
         "",
         f"🎯 <b>Signal</b>: <b>{signal}</b>",
