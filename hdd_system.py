@@ -229,56 +229,44 @@ def compute_rsi(series: np.ndarray, period: int = 14) -> float:
     return float(100.0 - (100.0 / (1.0 + (roll_up / roll_down))))
 
 def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
-    """
-    暴力駭客流：自動偵測 NG 轉倉跳空，利用 UNG 真實波動進行 Back-Adjusted (向後調整)
-    """
+    """暴力駭客流：自動偵測 NG 轉倉跳空，利用 UNG 真實波動進行 Back-Adjusted"""
     try:
         import yfinance as yf
         
-        # 1. 抓取 NG 期貨與 UNG ETF 歷史資料
         df_ng = yf.Ticker(symbol).history(period="6mo")[['High', 'Low', 'Close']]
         df_ung = yf.Ticker("UNG").history(period="6mo")[['Close']].rename(columns={'Close': 'Close_UNG'})
         
         if df_ng.empty or df_ung.empty: 
             return None
 
-        # 去除時區資訊以確保 join 完美對齊
         df_ng.index = df_ng.index.tz_localize(None)
         df_ung.index = df_ung.index.tz_localize(None)
 
-        # 2. 合併資料並對齊日期
         df = df_ng.join(df_ung, how='inner')
         if len(df) < 25:
             return None
 
-        # 3. 計算每日報酬率
         df['Ret_NG'] = df['Close'].pct_change()
         df['Ret_UNG'] = df['Close_UNG'].pct_change()
 
-        # 4. 偵測轉倉異常跳空 (設定閾值為 4% = 0.04 落差)
+        # 設定閾值為 4% = 0.04 落差
         threshold = 0.04
         anomaly_mask = (df['Ret_NG'] - df['Ret_UNG']).abs() > threshold
 
-        # 5. 修復報酬率：發生異常時，用 UNG 的真實報酬率取代 NG 的假跳空
         df['Fixed_Ret'] = df['Ret_NG']
         df.loc[anomaly_mask, 'Fixed_Ret'] = df.loc[anomaly_mask, 'Ret_UNG']
 
-        # 6. 向後倒推重建平滑的「調整後收盤價」(Back-Adjusted Close)
         adj_close = np.zeros(len(df))
-        adj_close[-1] = df['Close'].iloc[-1]  # 最後一天保持真實最新報價，錨定當下！
+        adj_close[-1] = df['Close'].iloc[-1]  # 錨定當下真實最新報價
 
         for i in range(len(df)-2, -1, -1):
-            # 昨天的價格 = 今天的價格 / (1 + 今天的真實報酬率)
             adj_close[i] = adj_close[i+1] / (1 + df['Fixed_Ret'].iloc[i+1])
 
         df['Adj_Close'] = adj_close
-
-        # 7. 計算調整比例，同步修復 High 和 Low，確保 ATR 計算正常
         df['Adj_Ratio'] = df['Adj_Close'] / df['Close']
         df['Adj_High'] = df['High'] * df['Adj_Ratio']
         df['Adj_Low'] = df['Low'] * df['Adj_Ratio']
 
-        # 8. 輸出乾淨的平滑 K 線
         out_df = pd.DataFrame({
             'High': df['Adj_High'],
             'Low': df['Adj_Low'],
@@ -300,15 +288,12 @@ def build_price_info() -> PriceInfo:
 
     if df is not None and len(df) >= 25:
         close_arr = df['Close'].values
-        close_val = float(close_arr[-1]) # 這是錨定過的最真實當下報價
+        close_val = float(close_arr[-1])
         ma20_val = float(np.mean(close_arr[-20:]))
         
-        # === 肯特納通道 (Keltner Channels) 計算 (基於修復後的平滑線圖) ===
-        # 1. 計算 EMA 20 (中軌)
         ema20 = df['Close'].ewm(span=20, adjust=False).mean()
         ema20_val = float(ema20.iloc[-1])
         
-        # 2. 計算 ATR 14 (真實波動幅度)
         prev_close = df['Close'].shift(1)
         tr1 = df['High'] - df['Low']
         tr2 = (df['High'] - prev_close).abs()
@@ -317,11 +302,9 @@ def build_price_info() -> PriceInfo:
         atr14 = tr.rolling(14).mean()
         atr_val = float(atr14.iloc[-1])
         
-        # 3. 計算 KC 上下軌 (Multiplier = 2)
         kc_upper_val = ema20_val + (2.0 * atr_val)
         kc_lower_val = ema20_val - (2.0 * atr_val)
         
-        # RSI & Volatility
         rsi_val = compute_rsi(close_arr, 14)
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
@@ -333,6 +316,51 @@ def build_price_info() -> PriceInfo:
             rsi14=rsi_val, vol10=vol_val, note="ok"
         )
     return PriceInfo(source="NA", symbol="NA", note="price fail")
+
+# =========================
+# 🛡️ STRICT MACRO GEOPOLITICAL RISK MODULE
+# =========================
+@dataclass
+class MacroRiskInfo:
+    oil_change_pct: float = 0.0
+    vix_change_pct: float = 0.0
+    is_war_risk_high: bool = False
+    note: str = ""
+
+def check_macro_risk() -> MacroRiskInfo:
+    """監控原油 (CL=F) 與 恐慌指數 (^VIX) 單日異動，判定地緣風險 (嚴格版)"""
+    try:
+        import yfinance as yf
+        tickers = yf.Tickers("CL=F ^VIX")
+        hist_oil = tickers.tickers['CL=F'].history(period="5d")['Close']
+        hist_vix = tickers.tickers['^VIX'].history(period="5d")['Close']
+        
+        if len(hist_oil) >= 2 and len(hist_vix) >= 2:
+            oil_change = (hist_oil.iloc[-1] / hist_oil.iloc[-2]) - 1.0
+            vix_change = (hist_vix.iloc[-1] / hist_vix.iloc[-2]) - 1.0
+            vix_current = float(hist_vix.iloc[-1])
+            
+            # 1. 雙重確認：原油漲 > 3.5% 且 VIX 漲 > 10% (股油雙殺恐慌)
+            cond_double = (oil_change > 0.035) and (vix_change > 0.10)
+            
+            # 2. 原油極端：單日飆升 > 5.5% (實質性斷供威脅)
+            cond_oil_extreme = (oil_change > 0.055)
+            
+            # 3. VIX 極端恐慌：單日飆漲 > 20% 且 絕對值 > 20 (避險情緒炸裂)
+            cond_vix_extreme = (vix_change > 0.20) and (vix_current > 20.0)
+            
+            # 滿足任一條件即觸發
+            is_risk_high = cond_double or cond_oil_extreme or cond_vix_extreme
+            
+            return MacroRiskInfo(
+                oil_change_pct=float(oil_change),
+                vix_change_pct=float(vix_change),
+                is_war_risk_high=bool(is_risk_high),
+                note="ok"
+            )
+    except Exception as e:
+        return MacroRiskInfo(note=str(e))
+    return MacroRiskInfo()
 
 # =========================
 # COT (Nasdaq)
@@ -380,9 +408,9 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
     plt.close(fig)
 
 # =========================
-# SIGNAL (預期差判定系統)
+# SIGNAL (預期差 + 地緣風險覆寫)
 # =========================
-def score_system(d_hdd_fut7, storage, price, cot) -> Tuple[int, int, int, int, int, str]:
+def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple[int, int, int, int, int, int, str]:
     w = 2 if d_hdd_fut7 > 0.1 else -2 if d_hdd_fut7 < -0.1 else 0
     
     s = 0
@@ -398,9 +426,22 @@ def score_system(d_hdd_fut7, storage, price, cot) -> Tuple[int, int, int, int, i
     p = 2 if price.close is not None and price.ma20 is not None and price.close > price.ma20 else -2 if price.close is not None else 0
     c = 1 if cot.net_managed_money is not None and cot.net_managed_money > 0 else -1 if cot.net_managed_money is not None else 0
     
-    total = w + s + p + c
-    sig = "BOIL LONG (2–5D)" if total >= 3 else "KOLD LONG (2–5D)" if total <= -3 else "WAIT"
-    return w, s, p, c, total, sig
+    # 💥 地緣風險分數覆寫 (Override)
+    macro_score = 4 if macro.is_war_risk_high else 0 
+    
+    total = w + s + p + c + macro_score
+    
+    # 決定訊號
+    if macro.is_war_risk_high:
+        sig = "BOIL LONG (WAR RISK OVERRIDE)"
+    elif total >= 3:
+        sig = "BOIL LONG (2–5D)"
+    elif total <= -3:
+        sig = "KOLD LONG (2–5D)"
+    else:
+        sig = "WAIT"
+        
+    return w, s, p, c, macro_score, total, sig
 
 # =========================
 # MAIN
@@ -427,8 +468,11 @@ def run():
     storage = fetch_storage_eia_v2(EIA_API_KEY)
     price = build_price_info()
     cot = fetch_cot_quandl(COT_DATASET_CODE, QUANDL_API_KEY) if ENABLE_COT else COTInfo()
+    
+    # 執行宏觀地緣風險檢查
+    macro = check_macro_risk()
 
-    w_score, s_score, p_score, c_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot)
+    w_score, s_score, p_score, c_score, m_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot, macro)
 
     # 將數據寫入 CSV
     row = {
@@ -447,9 +491,10 @@ def run():
         "price_kc_lower": price.kc_lower if price.kc_lower is not None else "",
         "price_atr": price.atr14 if price.atr14 is not None else "",
         "price_rsi14": price.rsi14 if price.rsi14 is not None else "",
-        "price_vol10": price.vol10 if price.vol10 is not None else "", "cot_net_managed_money": cot.net_managed_money if cot.net_managed_money is not None else "",
+        "price_vol10": price.vol10 if price.vol10 is not None else "", 
+        "cot_net_managed_money": cot.net_managed_money if cot.net_managed_money is not None else "",
         "score_weather": w_score, "score_storage": s_score, "score_price": p_score, "score_cot": c_score,
-        "score_total": total_score, "signal": signal, "notes": f"storage={storage.note}; price={price.note}"
+        "score_macro": m_score, "score_total": total_score, "signal": signal, "notes": f"storage={storage.note}; price={price.note}"
     }
     append_row(CSV_PATH, row)
     make_chart(wdf, f"{run_date} · {run_tag}", CHART_PATH)
@@ -459,7 +504,10 @@ def run():
     # =========================
     alerts = []
     
-    # 肯特納通道極端狀態告警
+    # 💣 地緣政治/宏觀風險最高級別警報
+    if macro.is_war_risk_high:
+        alerts.append(f"☢️ <b>地緣政治核彈警報</b>：偵測到避險資產異常飆升！原油單日變化 {macro.oil_change_pct*100:+.2f}%，VIX 變化 {macro.vix_change_pct*100:+.2f}%。系統已強制啟動防禦機制，推翻天氣空頭訊號！")
+
     if price.close is not None and price.kc_upper is not None and price.kc_lower is not None:
         if price.close > price.kc_upper:
             alerts.append(f"⚠️ <b>肯特納突破 (強勢反彈)</b>：收盤價突破上軌 ({price.kc_upper:.2f})！短線動能極強，注意壓力位分批停利。")
@@ -541,15 +589,20 @@ def run():
         lines.extend(["🧱 <b>Storage</b>: NA", f"• Note: {storage.note}", ""])
 
     lines.extend([
+        "🛡️ <b>Macro Risk (Oil / VIX)</b>",
+        f"• WTI Crude: <b>{macro.oil_change_pct*100:+.2f}%</b>",
+        f"• VIX Fear: <b>{macro.vix_change_pct*100:+.2f}%</b>",
+        f"• War Risk Triggered: <b>{'YES ☢️' if macro.is_war_risk_high else 'NO 🟢'}</b>",
+        "",
         f"📈 <b>Price</b> ({price.symbol})",
         f"• Close: <b>{p_close_str}</b> | EMA20(中軌): {p_ema20_str}",
         f"• KC 上軌: <b>{p_kc_up_str}</b> | KC 下軌: <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
         "",
-        "🧮 <b>Score</b> (Weather / Storage / Price / COT)",
-        f"• {w_score} / {s_score} / {p_score} / {c_score}  → Total: <b>{total_score}</b>",
+        "🧮 <b>Score</b> (Weather / Storage / Price / COT / Macro)",
+        f"• {w_score} / {s_score} / {p_score} / {c_score} / {m_score}  → Total: <b>{total_score}</b>",
         "",
-        f"🎯 <b>Signal</b>: {signal}",
+        f"🎯 <b>Signal</b>: <b>{signal}</b>",
         f"🕒 Updated: {run_ts}"
     ])
 
