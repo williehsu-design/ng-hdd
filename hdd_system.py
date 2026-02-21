@@ -141,7 +141,7 @@ def fut_sums(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 # =========================
-# STORAGE (5-Year Avg 對比版)
+# STORAGE
 # =========================
 @dataclass
 class StorageInfo:
@@ -203,7 +203,7 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, wow_5yr_avg=wow_5yr_avg, bias="DRAW" if wow < 0 else "BUILD", note="ok")
 
 # =========================
-# PRICE & BOLLINGER BANDS
+# PRICE & KELTNER CHANNELS
 # =========================
 @dataclass
 class PriceInfo:
@@ -211,8 +211,10 @@ class PriceInfo:
     symbol: str
     close: Optional[float] = None
     ma20: Optional[float] = None
-    bb_upper: Optional[float] = None
-    bb_lower: Optional[float] = None
+    ema20: Optional[float] = None
+    atr14: Optional[float] = None
+    kc_upper: Optional[float] = None
+    kc_lower: Optional[float] = None
     rsi14: Optional[float] = None
     vol10: Optional[float] = None
     note: str = ""
@@ -226,37 +228,54 @@ def compute_rsi(series: np.ndarray, period: int = 14) -> float:
     if roll_down == 0: return 100.0
     return float(100.0 - (100.0 / (1.0 + (roll_up / roll_down))))
 
-def fetch_price_yfinance(symbol: str) -> Optional[np.ndarray]:
+def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
     try:
         import yfinance as yf
-        df = yf.download(symbol, period="3mo", interval="1d", progress=False)
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="3mo") # 抓取更完整的 K 線數據
         if df is None or df.empty: return None
-        return df["Close"].squeeze().dropna().values
+        return df[['High', 'Low', 'Close']].dropna()
     except: return None
 
 def build_price_info() -> PriceInfo:
-    close_arr = fetch_price_yfinance(PRICE_SYMBOL_PRIMARY)
+    df = fetch_price_yfinance_df(PRICE_SYMBOL_PRIMARY)
     sym = PRICE_SYMBOL_PRIMARY
-    if close_arr is None:
-        close_arr = fetch_price_yfinance(PRICE_SYMBOL_FALLBACK)
+    if df is None or len(df) < 25:
+        df = fetch_price_yfinance_df(PRICE_SYMBOL_FALLBACK)
         sym = PRICE_SYMBOL_FALLBACK
 
-    if close_arr is not None and len(close_arr) >= 25:
+    if df is not None and len(df) >= 25:
+        close_arr = df['Close'].values
         close_val = float(close_arr[-1])
-        
-        # 布林通道計算 (20 MA, 2 個標準差)
         ma20_val = float(np.mean(close_arr[-20:]))
-        std20_val = float(np.std(close_arr[-20:])) 
-        bb_upper_val = ma20_val + (2.0 * std20_val)
-        bb_lower_val = ma20_val - (2.0 * std20_val)
         
+        # === 肯特納通道 (Keltner Channels) 計算 ===
+        # 1. 計算 EMA 20 (中軌)
+        ema20 = df['Close'].ewm(span=20, adjust=False).mean()
+        ema20_val = float(ema20.iloc[-1])
+        
+        # 2. 計算 ATR 14 (真實波動幅度)
+        prev_close = df['Close'].shift(1)
+        tr1 = df['High'] - df['Low']
+        tr2 = (df['High'] - prev_close).abs()
+        tr3 = (df['Low'] - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean()
+        atr_val = float(atr14.iloc[-1])
+        
+        # 3. 計算 KC 上下軌 (Multiplier = 2)
+        kc_upper_val = ema20_val + (2.0 * atr_val)
+        kc_lower_val = ema20_val - (2.0 * atr_val)
+        
+        # RSI & Volatility
         rsi_val = compute_rsi(close_arr, 14)
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
         
         return PriceInfo(
             source="YF", symbol=sym, close=close_val, 
-            ma20=ma20_val, bb_upper=bb_upper_val, bb_lower=bb_lower_val,
+            ma20=ma20_val, ema20=ema20_val, atr14=atr_val,
+            kc_upper=kc_upper_val, kc_lower=kc_lower_val,
             rsi14=rsi_val, vol10=vol_val, note="ok"
         )
     return PriceInfo(source="NA", symbol="NA", note="price fail")
@@ -357,7 +376,7 @@ def run():
 
     w_score, s_score, p_score, c_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot)
 
-    # 寫入 CSV 的資料加入布林通道
+    # 將 KC 數據寫入 CSV
     row = {
         "run_utc": run_ts, "date_utc": run_date, "run_tag": run_tag, "regime": "WINTER" if now.month in [11, 12, 1, 2, 3] else "SUMMER",
         "hdd_15d": round(m["hdd_15d"], 2), "hdd_30d": round(m["hdd_30d"], 2),
@@ -370,8 +389,9 @@ def run():
         "storage_wow_bcf": storage.wow_bcf if storage.wow_bcf is not None else "", "storage_bias": storage.bias,
         "price_symbol": price.symbol, "price_close": price.close if price.close is not None else "",
         "price_ma20": price.ma20 if price.ma20 is not None else "", 
-        "price_bb_upper": price.bb_upper if price.bb_upper is not None else "",
-        "price_bb_lower": price.bb_lower if price.bb_lower is not None else "",
+        "price_kc_upper": price.kc_upper if price.kc_upper is not None else "",
+        "price_kc_lower": price.kc_lower if price.kc_lower is not None else "",
+        "price_atr": price.atr14 if price.atr14 is not None else "",
         "price_rsi14": price.rsi14 if price.rsi14 is not None else "",
         "price_vol10": price.vol10 if price.vol10 is not None else "", "cot_net_managed_money": cot.net_managed_money if cot.net_managed_money is not None else "",
         "score_weather": w_score, "score_storage": s_score, "score_price": p_score, "score_cot": c_score,
@@ -385,12 +405,12 @@ def run():
     # =========================
     alerts = []
     
-    # 布林通道極端狀態告警
-    if price.close is not None and price.bb_upper is not None and price.bb_lower is not None:
-        if price.close > price.bb_upper:
-            alerts.append(f"⚠️ <b>布林突破 (喇叭口向上)</b>：收盤價突破上軌 ({price.bb_upper:.2f})！短線極度狂熱，適合作為波段停利點。")
-        elif price.close < price.bb_lower:
-            alerts.append(f"⚠️ <b>布林跌破 (喇叭口向下)</b>：收盤價跌破下軌 ({price.bb_lower:.2f})！恐慌性殺跌，注意反彈或保本。")
+    # 肯特納通道極端狀態告警
+    if price.close is not None and price.kc_upper is not None and price.kc_lower is not None:
+        if price.close > price.kc_upper:
+            alerts.append(f"⚠️ <b>肯特納突破 (強勢反彈)</b>：收盤價突破上軌 ({price.kc_upper:.2f})！短線動能極強，注意壓力位分批停利。")
+        elif price.close < price.kc_lower:
+            alerts.append(f"⚠️ <b>肯特納跌破 (極端超賣)</b>：收盤價跌破下軌 ({price.kc_lower:.2f})！恐慌性殺跌，準備抓死貓反彈。")
 
     if price.rsi14 is not None:
         if price.rsi14 < 25:
@@ -412,9 +432,10 @@ def run():
     # 組合 Telegram 訊息
     # =========================
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
-    p_ma20_str = f"{price.ma20:.3f}" if price.ma20 is not None else "NA"
-    p_bb_up_str = f"{price.bb_upper:.3f}" if price.bb_upper is not None else "NA"
-    p_bb_dn_str = f"{price.bb_lower:.3f}" if price.bb_lower is not None else "NA"
+    p_ema20_str = f"{price.ema20:.3f}" if price.ema20 is not None else "NA"
+    p_kc_up_str = f"{price.kc_upper:.3f}" if price.kc_upper is not None else "NA"
+    p_kc_dn_str = f"{price.kc_lower:.3f}" if price.kc_lower is not None else "NA"
+    p_atr_str = f"{price.atr14:.3f}" if price.atr14 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
     p_vol_str = f"{price.vol10*100:.2f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
 
@@ -453,7 +474,7 @@ def run():
             lines.append(f"• WoW: <b>{wow_str} bcf</b> (vs 5Yr Avg: {storage.wow_5yr_avg:+.0f} bcf)")
             lines.append(f"• Miss/Beat: <b>{diff:+.0f} bcf</b> (多空判定)")
             
-            # 加入庫存爆雷警示 (必須在這裡算 diff)
+            # 加入庫存爆雷警示
             if diff >= 30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
                 lines.insert(lines.index("🚨 <b>系統特別警示 (ALERTS)</b>") + 1, f"⚠️ <b>庫存大爆雷</b>：提款遠不及預期 (多出 {diff:+.0f} bcf)，極度利空！")
             elif diff <= -30 and "🚨 <b>系統特別警示 (ALERTS)</b>" in lines:
@@ -467,8 +488,8 @@ def run():
 
     lines.extend([
         f"📈 <b>Price</b> ({price.symbol})",
-        f"• Close: <b>{p_close_str}</b> | MA20(中軌): {p_ma20_str}",
-        f"• BB 上軌: <b>{p_bb_up_str}</b> | BB 下軌: <b>{p_bb_dn_str}</b>",
+        f"• Close: <b>{p_close_str}</b> | EMA20(中軌): {p_ema20_str}",
+        f"• KC 上軌: <b>{p_kc_up_str}</b> | KC 下軌: <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
         "",
         "🧮 <b>Score</b> (Weather / Storage / Price / COT)",
