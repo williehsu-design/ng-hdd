@@ -406,10 +406,20 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
     plt.close(fig)
 
 # =========================
-# SIGNAL (預期差 + 地緣風險覆寫)
+# SIGNAL (預期差 + 地緣風險覆寫 + 階梯式天氣評分)
 # =========================
 def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple[int, int, int, int, int, int, str]:
-    w = 2 if d_hdd_fut7 > 0.1 else -2 if d_hdd_fut7 < -0.1 else 0
+    # 🌡️ 升級版：天氣階梯式評分 (過濾模型雜訊)
+    if d_hdd_fut7 >= 10.0:
+        w = 2
+    elif d_hdd_fut7 >= 3.0:
+        w = 1
+    elif d_hdd_fut7 <= -10.0:
+        w = -2
+    elif d_hdd_fut7 <= -3.0:
+        w = -1
+    else:
+        w = 0  # 雜訊護城河
     
     s = 0
     if storage.wow_bcf is not None and storage.wow_5yr_avg is not None:
@@ -467,9 +477,7 @@ def run():
     macro = check_macro_risk()
     w_score, s_score, p_score, c_score, m_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot, macro)
 
-    # =========================
     # 動態隱藏數值 (數值極小時不顯示)
-    # =========================
     show_hdd = (m['hdd_30d'] + f['hdd_fut7']) > 0.5
     show_cdd = (m['cdd_30d'] + f['cdd_fut7']) > 0.5
 
@@ -549,7 +557,6 @@ def run():
         lines.extend(alerts)
         lines.append("")
 
-    # === 天氣區塊精簡 (動態隱藏) ===
     lines.append(f"🌡️ <b>Weather Demand</b> (base {BASE_F:.0f}F)")
     if show_hdd:
         lines.append(f"• HDD 15D/30D: <b>{m['hdd_15d']:.1f}</b> / {m['hdd_30d']:.1f}")
@@ -564,7 +571,6 @@ def run():
         lines.append(f"• CDD: <b>{f['cdd_fut7']:.1f}</b> ({fmt_arrow(d_cdd_fut7)} {d_cdd_fut7:+.1f})")
     lines.append("")
 
-    # === 庫存區塊 ===
     if storage.week and storage.total_bcf is not None:
         wow_str = f"{storage.wow_bcf:+.0f}" if storage.wow_bcf is not None else "NA"
         lines.extend([
@@ -581,7 +587,6 @@ def run():
     else:
         lines.extend(["🧱 <b>Storage</b>: NA", f"• Note: {storage.note}", ""])
 
-    # === 宏觀與價格區塊 ===
     lines.extend([
         "🛡️ <b>Macro Risk (Oil / VIX)</b>",
         f"• WTI: <b>{macro.oil_change_pct*100:+.1f}%</b> | VIX: <b>{macro.vix_change_pct*100:+.1f}%</b>",
