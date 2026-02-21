@@ -203,7 +203,7 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, wow_5yr_avg=wow_5yr_avg, bias="DRAW" if wow < 0 else "BUILD", note="ok")
 
 # =========================
-# PRICE
+# PRICE & BOLLINGER BANDS
 # =========================
 @dataclass
 class PriceInfo:
@@ -211,6 +211,8 @@ class PriceInfo:
     symbol: str
     close: Optional[float] = None
     ma20: Optional[float] = None
+    bb_upper: Optional[float] = None
+    bb_lower: Optional[float] = None
     rsi14: Optional[float] = None
     vol10: Optional[float] = None
     note: str = ""
@@ -241,11 +243,22 @@ def build_price_info() -> PriceInfo:
 
     if close_arr is not None and len(close_arr) >= 25:
         close_val = float(close_arr[-1])
+        
+        # 布林通道計算 (20 MA, 2 個標準差)
         ma20_val = float(np.mean(close_arr[-20:]))
+        std20_val = float(np.std(close_arr[-20:])) 
+        bb_upper_val = ma20_val + (2.0 * std20_val)
+        bb_lower_val = ma20_val - (2.0 * std20_val)
+        
         rsi_val = compute_rsi(close_arr, 14)
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
-        return PriceInfo(source="YF", symbol=sym, close=close_val, ma20=ma20_val, rsi14=rsi_val, vol10=vol_val, note="ok")
+        
+        return PriceInfo(
+            source="YF", symbol=sym, close=close_val, 
+            ma20=ma20_val, bb_upper=bb_upper_val, bb_lower=bb_lower_val,
+            rsi14=rsi_val, vol10=vol_val, note="ok"
+        )
     return PriceInfo(source="NA", symbol="NA", note="price fail")
 
 # =========================
@@ -344,6 +357,7 @@ def run():
 
     w_score, s_score, p_score, c_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot)
 
+    # 寫入 CSV 的資料加入布林通道
     row = {
         "run_utc": run_ts, "date_utc": run_date, "run_tag": run_tag, "regime": "WINTER" if now.month in [11, 12, 1, 2, 3] else "SUMMER",
         "hdd_15d": round(m["hdd_15d"], 2), "hdd_30d": round(m["hdd_30d"], 2),
@@ -355,7 +369,10 @@ def run():
         "storage_week": storage.week or "", "storage_total_bcf": storage.total_bcf if storage.total_bcf is not None else "",
         "storage_wow_bcf": storage.wow_bcf if storage.wow_bcf is not None else "", "storage_bias": storage.bias,
         "price_symbol": price.symbol, "price_close": price.close if price.close is not None else "",
-        "price_ma20": price.ma20 if price.ma20 is not None else "", "price_rsi14": price.rsi14 if price.rsi14 is not None else "",
+        "price_ma20": price.ma20 if price.ma20 is not None else "", 
+        "price_bb_upper": price.bb_upper if price.bb_upper is not None else "",
+        "price_bb_lower": price.bb_lower if price.bb_lower is not None else "",
+        "price_rsi14": price.rsi14 if price.rsi14 is not None else "",
         "price_vol10": price.vol10 if price.vol10 is not None else "", "cot_net_managed_money": cot.net_managed_money if cot.net_managed_money is not None else "",
         "score_weather": w_score, "score_storage": s_score, "score_price": p_score, "score_cot": c_score,
         "score_total": total_score, "signal": signal, "notes": f"storage={storage.note}; price={price.note}"
@@ -368,6 +385,13 @@ def run():
     # =========================
     alerts = []
     
+    # 布林通道極端狀態告警
+    if price.close is not None and price.bb_upper is not None and price.bb_lower is not None:
+        if price.close > price.bb_upper:
+            alerts.append(f"⚠️ <b>布林突破 (喇叭口向上)</b>：收盤價突破上軌 ({price.bb_upper:.2f})！短線極度狂熱，適合作為波段停利點。")
+        elif price.close < price.bb_lower:
+            alerts.append(f"⚠️ <b>布林跌破 (喇叭口向下)</b>：收盤價跌破下軌 ({price.bb_lower:.2f})！恐慌性殺跌，注意反彈或保本。")
+
     if price.rsi14 is not None:
         if price.rsi14 < 25:
             alerts.append(f"⚠️ <b>極度超賣 (RSI={price.rsi14:.1f})</b>：空頭動能衰竭，慎防報復性反彈！")
@@ -389,6 +413,8 @@ def run():
     # =========================
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ma20_str = f"{price.ma20:.3f}" if price.ma20 is not None else "NA"
+    p_bb_up_str = f"{price.bb_upper:.3f}" if price.bb_upper is not None else "NA"
+    p_bb_dn_str = f"{price.bb_lower:.3f}" if price.bb_lower is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
     p_vol_str = f"{price.vol10*100:.2f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
 
@@ -441,7 +467,8 @@ def run():
 
     lines.extend([
         f"📈 <b>Price</b> ({price.symbol})",
-        f"• Close: {p_close_str} | MA20: {p_ma20_str}",
+        f"• Close: <b>{p_close_str}</b> | MA20(中軌): {p_ma20_str}",
+        f"• BB 上軌: <b>{p_bb_up_str}</b> | BB 下軌: <b>{p_bb_dn_str}</b>",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
         "",
         "🧮 <b>Score</b> (Weather / Storage / Price / COT)",
