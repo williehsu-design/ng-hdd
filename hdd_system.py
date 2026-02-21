@@ -203,7 +203,7 @@ def fetch_storage_eia_v2(api_key: str) -> StorageInfo:
     return StorageInfo(week=curr_period, total_bcf=curr_val, wow_bcf=wow, wow_5yr_avg=wow_5yr_avg, bias="DRAW" if wow < 0 else "BUILD", note="ok")
 
 # =========================
-# PRICE & KELTNER CHANNELS
+# PRICE & HACKER BACK-ADJUSTED KELTNER CHANNELS
 # =========================
 @dataclass
 class PriceInfo:
@@ -229,13 +229,67 @@ def compute_rsi(series: np.ndarray, period: int = 14) -> float:
     return float(100.0 - (100.0 / (1.0 + (roll_up / roll_down))))
 
 def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
+    """
+    暴力駭客流：自動偵測 NG 轉倉跳空，利用 UNG 真實波動進行 Back-Adjusted (向後調整)
+    """
     try:
         import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="3mo") # 抓取更完整的 K 線數據
-        if df is None or df.empty: return None
-        return df[['High', 'Low', 'Close']].dropna()
-    except: return None
+        
+        # 1. 抓取 NG 期貨與 UNG ETF 歷史資料
+        df_ng = yf.Ticker(symbol).history(period="6mo")[['High', 'Low', 'Close']]
+        df_ung = yf.Ticker("UNG").history(period="6mo")[['Close']].rename(columns={'Close': 'Close_UNG'})
+        
+        if df_ng.empty or df_ung.empty: 
+            return None
+
+        # 去除時區資訊以確保 join 完美對齊
+        df_ng.index = df_ng.index.tz_localize(None)
+        df_ung.index = df_ung.index.tz_localize(None)
+
+        # 2. 合併資料並對齊日期
+        df = df_ng.join(df_ung, how='inner')
+        if len(df) < 25:
+            return None
+
+        # 3. 計算每日報酬率
+        df['Ret_NG'] = df['Close'].pct_change()
+        df['Ret_UNG'] = df['Close_UNG'].pct_change()
+
+        # 4. 偵測轉倉異常跳空 (設定閾值為 4% = 0.04 落差)
+        threshold = 0.04
+        anomaly_mask = (df['Ret_NG'] - df['Ret_UNG']).abs() > threshold
+
+        # 5. 修復報酬率：發生異常時，用 UNG 的真實報酬率取代 NG 的假跳空
+        df['Fixed_Ret'] = df['Ret_NG']
+        df.loc[anomaly_mask, 'Fixed_Ret'] = df.loc[anomaly_mask, 'Ret_UNG']
+
+        # 6. 向後倒推重建平滑的「調整後收盤價」(Back-Adjusted Close)
+        adj_close = np.zeros(len(df))
+        adj_close[-1] = df['Close'].iloc[-1]  # 最後一天保持真實最新報價，錨定當下！
+
+        for i in range(len(df)-2, -1, -1):
+            # 昨天的價格 = 今天的價格 / (1 + 今天的真實報酬率)
+            adj_close[i] = adj_close[i+1] / (1 + df['Fixed_Ret'].iloc[i+1])
+
+        df['Adj_Close'] = adj_close
+
+        # 7. 計算調整比例，同步修復 High 和 Low，確保 ATR 計算正常
+        df['Adj_Ratio'] = df['Adj_Close'] / df['Close']
+        df['Adj_High'] = df['High'] * df['Adj_Ratio']
+        df['Adj_Low'] = df['Low'] * df['Adj_Ratio']
+
+        # 8. 輸出乾淨的平滑 K 線
+        out_df = pd.DataFrame({
+            'High': df['Adj_High'],
+            'Low': df['Adj_Low'],
+            'Close': df['Adj_Close']
+        }, index=df.index)
+        
+        return out_df.dropna()
+
+    except Exception as e:
+        print(f"Back-Adjust Error: {e}")
+        return None
 
 def build_price_info() -> PriceInfo:
     df = fetch_price_yfinance_df(PRICE_SYMBOL_PRIMARY)
@@ -246,10 +300,10 @@ def build_price_info() -> PriceInfo:
 
     if df is not None and len(df) >= 25:
         close_arr = df['Close'].values
-        close_val = float(close_arr[-1])
+        close_val = float(close_arr[-1]) # 這是錨定過的最真實當下報價
         ma20_val = float(np.mean(close_arr[-20:]))
         
-        # === 肯特納通道 (Keltner Channels) 計算 ===
+        # === 肯特納通道 (Keltner Channels) 計算 (基於修復後的平滑線圖) ===
         # 1. 計算 EMA 20 (中軌)
         ema20 = df['Close'].ewm(span=20, adjust=False).mean()
         ema20_val = float(ema20.iloc[-1])
@@ -273,7 +327,7 @@ def build_price_info() -> PriceInfo:
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
         
         return PriceInfo(
-            source="YF", symbol=sym, close=close_val, 
+            source="YF_Hacked", symbol=sym, close=close_val, 
             ma20=ma20_val, ema20=ema20_val, atr14=atr_val,
             kc_upper=kc_upper_val, kc_lower=kc_lower_val,
             rsi14=rsi_val, vol10=vol_val, note="ok"
@@ -376,7 +430,7 @@ def run():
 
     w_score, s_score, p_score, c_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot)
 
-    # 將 KC 數據寫入 CSV
+    # 將數據寫入 CSV
     row = {
         "run_utc": run_ts, "date_utc": run_date, "run_tag": run_tag, "regime": "WINTER" if now.month in [11, 12, 1, 2, 3] else "SUMMER",
         "hdd_15d": round(m["hdd_15d"], 2), "hdd_30d": round(m["hdd_30d"], 2),
