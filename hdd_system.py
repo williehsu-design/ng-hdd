@@ -406,10 +406,10 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
     plt.close(fig)
 
 # =========================
-# SIGNAL (預期差 + 地緣風險覆寫 + 階梯式天氣評分)
+# SIGNAL (預期差 + 地緣風險覆寫 + 雙重價格評分)
 # =========================
 def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple[int, int, int, int, int, int, str]:
-    # 🌡️ 升級版：天氣階梯式評分 (過濾模型雜訊)
+    # 1. 🌡️ 升級版：天氣階梯式評分 (過濾模型雜訊)
     if d_hdd_fut7 >= 10.0:
         w = 2
     elif d_hdd_fut7 >= 3.0:
@@ -419,8 +419,9 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     elif d_hdd_fut7 <= -3.0:
         w = -1
     else:
-        w = 0  # 雜訊護城河
+        w = 0  
     
+    # 2. 🧱 庫存評分
     s = 0
     if storage.wow_bcf is not None and storage.wow_5yr_avg is not None:
         diff = storage.wow_bcf - storage.wow_5yr_avg
@@ -431,12 +432,28 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     elif storage.wow_bcf is not None:
         s = 2 if storage.wow_bcf < -10 else -2 if storage.wow_bcf > 10 else 0
 
-    p = 2 if price.close is not None and price.ma20 is not None and price.close > price.ma20 else -2 if price.close is not None else 0
+    # 3. 📈 升級版：價格與動能雙重評分 (趨勢 + 均值回歸)
+    p = 0
+    if price.close is not None and price.ma20 is not None and price.rsi14 is not None:
+        if price.close > price.ma20:
+            if price.rsi14 > 75:
+                p = -1  # 均線之上但極度超買，隨時拉回 (頂部逃命)
+            else:
+                p = 2   # 穩健的多頭趨勢
+        else:
+            if price.rsi14 < 25:
+                p = 1   # 均線之下但極度超賣，極易引發報復性反彈 (抄底/死貓跳)
+            else:
+                p = -2  # 穩健的空頭趨勢 (均線壓制且無超賣保護)
+
+    # 4. 籌碼評分
     c = 1 if cot.net_managed_money is not None and cot.net_managed_money > 0 else -1 if cot.net_managed_money is not None else 0
     
+    # 5. 💣 宏觀戰爭風險覆寫
     macro_score = 4 if macro.is_war_risk_high else 0 
     total = w + s + p + c + macro_score
     
+    # 決定最終訊號
     if macro.is_war_risk_high:
         sig = "BOIL LONG (WAR RISK OVERRIDE)"
     elif total >= 3:
