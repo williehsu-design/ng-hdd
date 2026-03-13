@@ -303,7 +303,6 @@ def build_price_info() -> PriceInfo:
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
         
-        # 抓取 UNG (ETF) 空單佔比做為全市場籌碼參考 - 增強版
         short_float_pct = None
         try:
             import yfinance as yf
@@ -376,10 +375,7 @@ class COTInfo:
     note: str = "disabled"
 
 def fetch_cot_cftc() -> COTInfo:
-    """直接從美國 CFTC 官方 API 抓取大額交易人報告 (Disaggregated Futures Only)"""
     url = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
-    
-    # 023651 是 NYMEX Henry Hub 天然氣合約代碼
     params = {
         "cftc_contract_market_code": "023651",
         "$order": "report_date_as_yyyy_mm_dd DESC",
@@ -394,13 +390,11 @@ def fetch_cot_cftc() -> COTInfo:
         if not data or len(data) == 0:
             return COTInfo(note="Empty CFTC data")
             
-        # 本週數據 (Managed Money = m_money)
         curr = data[0]
         mm_long_curr = float(curr.get("m_money_positions_long_all", 0))
         mm_short_curr = float(curr.get("m_money_positions_short_all", 0))
         net_curr = mm_long_curr - mm_short_curr
         
-        # 上週數據以計算 WoW 變化
         if len(data) > 1:
             prev = data[1]
             mm_long_prev = float(prev.get("m_money_positions_long_all", 0))
@@ -479,7 +473,6 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     if cot.net_wow_change is not None:
         c += 1 if cot.net_wow_change > 0 else -1
         
-    # 若空單極高且技術面/基本面不差，加入軋空加分 (Short Squeeze Potential)
     if price.short_float_pct is not None and price.short_float_pct >= 15.0:
         if (w + s + p) >= 0:
             c += 1
@@ -489,7 +482,6 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     
     total = w + s + p + c + macro_score
     
-    # 決定最終訊號
     if macro.is_war_risk_high:
         sig = "BOIL LONG (WAR RISK OVERRIDE)"
     elif total >= 3:
@@ -525,7 +517,7 @@ def run():
 
     storage = fetch_storage_eia_v2(EIA_API_KEY)
     price = build_price_info()
-    cot = fetch_cot_cftc()  # 永遠執行 CFTC 抓取
+    cot = fetch_cot_cftc()
     macro = check_macro_risk()
     
     w_score, s_score, p_score, c_score, m_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot, macro)
@@ -602,11 +594,9 @@ def run():
     p_atr_str = f"{price.atr14:.3f}" if price.atr14 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
     p_vol_str = f"{price.vol10*100:.1f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
-    p_short_str = f"{price.short_float_pct:.1f}%" if price.short_float_pct is not None else "NA"
 
     lines = [
         f"📌 <b>NG Composite Update ({run_date})</b>",
-        f"• Run: <b>{run_tag}</b>",
         ""
     ]
     
@@ -654,7 +644,6 @@ def run():
         f"• Close: <b>{p_close_str}</b> | EMA20: {p_ema20_str}",
         f"• KC 軌道: <b>{p_kc_up_str}</b> / <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
-        f"• Short Float (空單佔比): <b>{p_short_str}</b>",
         ""
     ])
 
@@ -674,8 +663,7 @@ def run():
         "🧮 <b>Score</b> (W / S / P / C / M)",
         f"• {w_score} / {s_score} / {p_score} / {c_score} / {m_score}  → Total: <b>{total_score}</b>",
         "",
-        f"🎯 <b>Signal</b>: <b>{signal}</b>",
-        f"🕒 Updated: {run_ts}"
+        f"🎯 <b>Signal</b>: <b>{signal}</b>"
     ])
 
     msg = "\n".join(lines)
