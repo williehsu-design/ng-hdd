@@ -32,7 +32,6 @@ PRICE_SYMBOL_FALLBACK = "UNG"
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 EIA_API_KEY = os.getenv("EIA_API_KEY", "").strip()
-# 已經移除 QUANDL_API_KEY 與 ENABLE_COT，全面改用 CFTC 免費官方 API
 
 # =========================
 # HELPERS
@@ -374,7 +373,7 @@ class COTInfo:
 
 def fetch_cot_cftc() -> COTInfo:
     """直接從美國 CFTC 官方 API 抓取大額交易人報告 (Disaggregated Futures Only)"""
-    url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+    url = "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
     
     # 023651 是 NYMEX Henry Hub 天然氣合約代碼
     params = {
