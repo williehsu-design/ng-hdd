@@ -303,13 +303,17 @@ def build_price_info() -> PriceInfo:
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
         
-        # 抓取 UNG (ETF) 空單佔比做為全市場籌碼參考
+        # 抓取 UNG (ETF) 空單佔比做為全市場籌碼參考 - 增強版
         short_float_pct = None
         try:
             import yfinance as yf
             info = yf.Ticker("UNG").info
-            if "shortPercentOfFloat" in info and info["shortPercentOfFloat"] is not None:
+            if info.get("shortPercentOfFloat") is not None:
                 short_float_pct = float(info["shortPercentOfFloat"]) * 100.0
+            elif info.get("sharesShort") and info.get("floatShares"):
+                short_float_pct = (float(info["sharesShort"]) / float(info["floatShares"])) * 100.0
+            elif info.get("sharesShort") and info.get("sharesOutstanding"):
+                short_float_pct = (float(info["sharesShort"]) / float(info["sharesOutstanding"])) * 100.0
         except:
             pass
         
