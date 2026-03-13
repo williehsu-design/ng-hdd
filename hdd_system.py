@@ -217,6 +217,7 @@ class PriceInfo:
     kc_lower: Optional[float] = None
     rsi14: Optional[float] = None
     vol10: Optional[float] = None
+    short_float_pct: Optional[float] = None
     note: str = ""
 
 def compute_rsi(series: np.ndarray, period: int = 14) -> float:
@@ -229,10 +230,8 @@ def compute_rsi(series: np.ndarray, period: int = 14) -> float:
     return float(100.0 - (100.0 / (1.0 + (roll_up / roll_down))))
 
 def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
-    """暴力駭客流：自動偵測 NG 轉倉跳空，利用 UNG 真實波動進行 Back-Adjusted"""
     try:
         import yfinance as yf
-        
         df_ng = yf.Ticker(symbol).history(period="6mo")[['High', 'Low', 'Close']]
         df_ung = yf.Ticker("UNG").history(period="6mo")[['Close']].rename(columns={'Close': 'Close_UNG'})
         
@@ -273,7 +272,6 @@ def fetch_price_yfinance_df(symbol: str) -> Optional[pd.DataFrame]:
         }, index=df.index)
         
         return out_df.dropna()
-
     except Exception as e:
         print(f"Back-Adjust Error: {e}")
         return None
@@ -308,11 +306,21 @@ def build_price_info() -> PriceInfo:
         ret = pd.Series(close_arr).pct_change().dropna()
         vol_val = float(ret.tail(10).std() * np.sqrt(252))
         
+        # 抓取 UNG (ETF) 空單佔比做為全市場籌碼參考
+        short_float_pct = None
+        try:
+            import yfinance as yf
+            info = yf.Ticker("UNG").info
+            if "shortPercentOfFloat" in info and info["shortPercentOfFloat"] is not None:
+                short_float_pct = float(info["shortPercentOfFloat"]) * 100.0
+        except:
+            pass
+        
         return PriceInfo(
             source="YF_Hacked", symbol=sym, close=close_val, 
             ma20=ma20_val, ema20=ema20_val, atr14=atr_val,
             kc_upper=kc_upper_val, kc_lower=kc_lower_val,
-            rsi14=rsi_val, vol10=vol_val, note="ok"
+            rsi14=rsi_val, vol10=vol_val, short_float_pct=short_float_pct, note="ok"
         )
     return PriceInfo(source="NA", symbol="NA", note="price fail")
 
@@ -327,7 +335,6 @@ class MacroRiskInfo:
     note: str = ""
 
 def check_macro_risk() -> MacroRiskInfo:
-    """監控原油 (CL=F) 與 恐慌指數 (^VIX) 單日異動，判定地緣風險 (嚴格版)"""
     try:
         import yfinance as yf
         tickers = yf.Tickers("CL=F ^VIX")
@@ -339,13 +346,8 @@ def check_macro_risk() -> MacroRiskInfo:
             vix_change = (hist_vix.iloc[-1] / hist_vix.iloc[-2]) - 1.0
             vix_current = float(hist_vix.iloc[-1])
             
-            # 1. 雙重確認：原油漲 > 3.5% 且 VIX 漲 > 10%
             cond_double = (oil_change > 0.035) and (vix_change > 0.10)
-            
-            # 2. 原油極端：單日飆升 > 5.5%
             cond_oil_extreme = (oil_change > 0.055)
-            
-            # 3. VIX 極端恐慌：單日飆漲 > 20% 且 絕對值 > 20
             cond_vix_extreme = (vix_change > 0.20) and (vix_current > 20.0)
             
             is_risk_high = cond_double or cond_oil_extreme or cond_vix_extreme
@@ -366,6 +368,10 @@ def check_macro_risk() -> MacroRiskInfo:
 @dataclass
 class COTInfo:
     net_managed_money: Optional[float] = None
+    mm_long: Optional[float] = None
+    mm_short: Optional[float] = None
+    ls_ratio: Optional[float] = None
+    net_wow_change: Optional[float] = None
     note: str = "disabled"
 
 def fetch_cot_quandl(dataset_code: str, api_key: str) -> COTInfo:
@@ -373,14 +379,33 @@ def fetch_cot_quandl(dataset_code: str, api_key: str) -> COTInfo:
     url = f"https://data.nasdaq.com/api/v3/datasets/{dataset_code}.json"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = retry_get(url, params={"api_key": api_key, "rows": 5}, headers=headers)
+        r = retry_get(url, params={"api_key": api_key, "rows": 2}, headers=headers)
         if isinstance(r, str): return COTInfo(note=r[:30])
         ds = r.json().get("dataset", {})
         cols, data = ds.get("column_names", []), ds.get("data", [])
         if not cols or not data: return COTInfo(note="Empty")
         df = pd.DataFrame(data, columns=cols)
-        cand = [c for c in df.columns if "Managed" in c and "Net" in c]
-        if cand: return COTInfo(net_managed_money=float(df.iloc[0][cand[0]]), note="ok")
+        
+        cand_net = [c for c in df.columns if "Managed" in c and "Net" in c]
+        cand_long = [c for c in df.columns if "Managed" in c and "Long" in c]
+        cand_short = [c for c in df.columns if "Managed" in c and "Short" in c]
+        
+        if cand_net and len(df) >= 1:
+            net_curr = float(df.iloc[0][cand_net[0]])
+            net_prev = float(df.iloc[1][cand_net[0]]) if len(df) > 1 else net_curr
+            
+            mm_long = float(df.iloc[0][cand_long[0]]) if cand_long else None
+            mm_short = float(df.iloc[0][cand_short[0]]) if cand_short else None
+            ls_ratio = (mm_long / mm_short) if (mm_long and mm_short and mm_short > 0) else None
+            
+            return COTInfo(
+                net_managed_money=net_curr,
+                mm_long=mm_long,
+                mm_short=mm_short,
+                ls_ratio=ls_ratio,
+                net_wow_change=net_curr - net_prev,
+                note="ok"
+            )
         return COTInfo(note="Col missing")
     except Exception as e:
         err = str(e)
@@ -406,22 +431,17 @@ def make_chart(weather_df: pd.DataFrame, run_tag: str, out_path: str) -> None:
     plt.close(fig)
 
 # =========================
-# SIGNAL (預期差 + 地緣風險覆寫 + 雙重價格評分)
+# SIGNAL (整合籌碼多空/軋空因子)
 # =========================
 def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple[int, int, int, int, int, int, str]:
-    # 1. 🌡️ 升級版：天氣階梯式評分 (過濾模型雜訊)
-    if d_hdd_fut7 >= 10.0:
-        w = 2
-    elif d_hdd_fut7 >= 3.0:
-        w = 1
-    elif d_hdd_fut7 <= -10.0:
-        w = -2
-    elif d_hdd_fut7 <= -3.0:
-        w = -1
-    else:
-        w = 0  
+    # 1. 🌡️ 天氣
+    if d_hdd_fut7 >= 10.0: w = 2
+    elif d_hdd_fut7 >= 3.0: w = 1
+    elif d_hdd_fut7 <= -10.0: w = -2
+    elif d_hdd_fut7 <= -3.0: w = -1
+    else: w = 0  
     
-    # 2. 🧱 庫存評分
+    # 2. 🧱 庫存
     s = 0
     if storage.wow_bcf is not None and storage.wow_5yr_avg is not None:
         diff = storage.wow_bcf - storage.wow_5yr_avg
@@ -432,25 +452,30 @@ def score_system(d_hdd_fut7, storage, price, cot, macro: MacroRiskInfo) -> Tuple
     elif storage.wow_bcf is not None:
         s = 2 if storage.wow_bcf < -10 else -2 if storage.wow_bcf > 10 else 0
 
-    # 3. 📈 升級版：價格與動能雙重評分 (趨勢 + 均值回歸)
+    # 3. 📈 價格
     p = 0
     if price.close is not None and price.ma20 is not None and price.rsi14 is not None:
         if price.close > price.ma20:
-            if price.rsi14 > 75:
-                p = -1  # 均線之上但極度超買，隨時拉回 (頂部逃命)
-            else:
-                p = 2   # 穩健的多頭趨勢
+            p = -1 if price.rsi14 > 75 else 2
         else:
-            if price.rsi14 < 25:
-                p = 1   # 均線之下但極度超賣，極易引發報復性反彈 (抄底/死貓跳)
-            else:
-                p = -2  # 穩健的空頭趨勢 (均線壓制且無超賣保護)
+            p = 1 if price.rsi14 < 25 else -2
 
-    # 4. 籌碼評分
-    c = 1 if cot.net_managed_money is not None and cot.net_managed_money > 0 else -1 if cot.net_managed_money is not None else 0
+    # 4. 🏛️ 籌碼與空單 (升級版)
+    c = 0
+    if cot.net_managed_money is not None:
+        c += 1 if cot.net_managed_money > 0 else -1
+        
+    if cot.net_wow_change is not None:
+        c += 1 if cot.net_wow_change > 0 else -1
+        
+    # 若空單極高且技術面/基本面不差，加入軋空加分 (Short Squeeze Potential)
+    if price.short_float_pct is not None and price.short_float_pct >= 15.0:
+        if (w + s + p) >= 0:
+            c += 1
     
-    # 5. 💣 宏觀戰爭風險覆寫
+    # 5. 💣 宏觀戰爭風險
     macro_score = 4 if macro.is_war_risk_high else 0 
+    
     total = w + s + p + c + macro_score
     
     # 決定最終訊號
@@ -490,11 +515,10 @@ def run():
     storage = fetch_storage_eia_v2(EIA_API_KEY)
     price = build_price_info()
     cot = fetch_cot_quandl(COT_DATASET_CODE, QUANDL_API_KEY) if ENABLE_COT else COTInfo()
-    
     macro = check_macro_risk()
+    
     w_score, s_score, p_score, c_score, m_score, total_score, signal = score_system(d_hdd_fut7, storage, price, cot, macro)
 
-    # 動態隱藏數值 (數值極小時不顯示)
     show_hdd = (m['hdd_30d'] + f['hdd_fut7']) > 0.5
     show_cdd = (m['cdd_30d'] + f['cdd_fut7']) > 0.5
 
@@ -515,7 +539,12 @@ def run():
         "price_atr": price.atr14 if price.atr14 is not None else "",
         "price_rsi14": price.rsi14 if price.rsi14 is not None else "",
         "price_vol10": price.vol10 if price.vol10 is not None else "", 
+        "price_short_float": price.short_float_pct if price.short_float_pct is not None else "",
         "cot_net_managed_money": cot.net_managed_money if cot.net_managed_money is not None else "",
+        "cot_mm_long": cot.mm_long if cot.mm_long is not None else "",
+        "cot_mm_short": cot.mm_short if cot.mm_short is not None else "",
+        "cot_ls_ratio": cot.ls_ratio if cot.ls_ratio is not None else "",
+        "cot_wow_change": cot.net_wow_change if cot.net_wow_change is not None else "",
         "score_weather": w_score, "score_storage": s_score, "score_price": p_score, "score_cot": c_score,
         "score_macro": m_score, "score_total": total_score, "signal": signal, "notes": f"storage={storage.note}; price={price.note}"
     }
@@ -528,13 +557,13 @@ def run():
     alerts = []
     
     if macro.is_war_risk_high:
-        alerts.append(f"☢️ <b>地緣政治核彈警報</b>：偵測到避險資產異常飆升！原油單日變化 {macro.oil_change_pct*100:+.2f}%，VIX 變化 {macro.vix_change_pct*100:+.2f}%。系統已強制啟動防禦機制！")
+        alerts.append(f"☢️ <b>地緣政治核彈警報</b>：偵測到避險資產異常飆升！原油變化 {macro.oil_change_pct*100:+.2f}%，VIX 變化 {macro.vix_change_pct*100:+.2f}%。")
 
     if price.close is not None and price.kc_upper is not None and price.kc_lower is not None:
         if price.close > price.kc_upper:
-            alerts.append(f"⚠️ <b>肯特納突破 (強勢反彈)</b>：收盤價突破上軌 ({price.kc_upper:.2f})！短線動能極強，注意壓力位分批停利。")
+            alerts.append(f"⚠️ <b>肯特納突破 (強勢)</b>：收盤突破上軌 ({price.kc_upper:.2f})！短線動能極強，注意分批停利。")
         elif price.close < price.kc_lower:
-            alerts.append(f"⚠️ <b>肯特納跌破 (極端超賣)</b>：收盤價跌破下軌 ({price.kc_lower:.2f})！恐慌性殺跌，準備抓死貓反彈。")
+            alerts.append(f"⚠️ <b>肯特納跌破 (極端超賣)</b>：收盤跌破下軌 ({price.kc_lower:.2f})！恐慌性殺跌，準備抓死貓反彈。")
 
     if price.rsi14 is not None:
         if price.rsi14 < 25:
@@ -542,18 +571,18 @@ def run():
         elif price.rsi14 > 75:
             alerts.append(f"⚠️ <b>極度超買 (RSI={price.rsi14:.1f})</b>：多頭過熱，慎防高檔暴跌！")
             
-    if price.vol10 is not None and price.vol10 > 0.60:
-        alerts.append(f"⚠️ <b>波動率失控 (Vol10={price.vol10*100:.1f}%)</b>：盤勢不穩，建議縮小留倉部位。")
+    if price.short_float_pct is not None and price.short_float_pct > 15.0:
+        alerts.append(f"🔥 <b>軋空預警 (Short Float {price.short_float_pct:.1f}%)</b>：市場空單極高，一旦反轉將觸發軋空大暴漲！")
 
     if abs(d_hdd_fut7) >= 10.0:
         dir_str = "轉冷" if d_hdd_fut7 > 0 else "轉暖"
         alerts.append(f"⚠️ <b>氣象突變</b>：預報大幅{dir_str} (變化 {d_hdd_fut7:+.1f} HDD)！")
 
     if now.weekday() == 4:
-        alerts.append("⚠️ <b>週末跳空風險</b>：今日為週五，請評估戰局/氣象突變風險，切忌滿倉過週末！")
+        alerts.append("⚠️ <b>週末跳空風險</b>：今日為週五，切忌滿倉過週末！")
 
     # =========================
-    # 組合 Telegram 訊息 (版面精簡化)
+    # 組合 Telegram 訊息
     # =========================
     p_close_str = f"{price.close:.3f}" if price.close is not None else "NA"
     p_ema20_str = f"{price.ema20:.3f}" if price.ema20 is not None else "NA"
@@ -562,6 +591,7 @@ def run():
     p_atr_str = f"{price.atr14:.3f}" if price.atr14 is not None else "NA"
     p_rsi_str = f"{price.rsi14:.1f}" if price.rsi14 is not None and not np.isnan(price.rsi14) else "NA"
     p_vol_str = f"{price.vol10*100:.1f}%" if price.vol10 is not None and not np.isnan(price.vol10) else "NA"
+    p_short_str = f"{price.short_float_pct:.1f}%" if price.short_float_pct is not None else "NA"
 
     lines = [
         f"📌 <b>NG Composite Update ({run_date})</b>",
@@ -609,11 +639,27 @@ def run():
         f"• WTI: <b>{macro.oil_change_pct*100:+.1f}%</b> | VIX: <b>{macro.vix_change_pct*100:+.1f}%</b>",
         f"• War Risk Triggered: <b>{'YES ☢️' if macro.is_war_risk_high else 'NO 🟢'}</b>",
         "",
-        f"📈 <b>Price</b> ({price.symbol})",
+        f"📈 <b>Price & Sentiment</b> ({price.symbol})",
         f"• Close: <b>{p_close_str}</b> | EMA20: {p_ema20_str}",
         f"• KC 軌道: <b>{p_kc_up_str}</b> / <b>{p_kc_dn_str}</b> (ATR: {p_atr_str})",
         f"• RSI14: {p_rsi_str} | Vol10: {p_vol_str}",
-        "",
+        f"• Short Float (空單佔比): <b>{p_short_str}</b>",
+        ""
+    ])
+
+    if cot.net_managed_money is not None:
+        cot_wow_str = f"{cot.net_wow_change:+.0f}" if cot.net_wow_change is not None else "NA"
+        ls_ratio_str = f"{cot.ls_ratio:.2f}" if cot.ls_ratio is not None else "NA"
+        lines.extend([
+            "🏛️ <b>COT Positioning (Managed Money)</b>",
+            f"• Net Pos: <b>{cot.net_managed_money:.0f}</b> (WoW: {cot_wow_str})",
+            f"• L/S Ratio: <b>{ls_ratio_str}</b> (L: {cot.mm_long} / S: {cot.mm_short})",
+            ""
+        ])
+    else:
+        lines.extend(["🏛️ <b>COT Positioning</b>: NA (Disabled or Error)", ""])
+
+    lines.extend([
         "🧮 <b>Score</b> (W / S / P / C / M)",
         f"• {w_score} / {s_score} / {p_score} / {c_score} / {m_score}  → Total: <b>{total_score}</b>",
         "",
